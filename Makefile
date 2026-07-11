@@ -10,3 +10,5 @@ run:
 	@sqlx migrate run
 	@cargo run
 
+push:
+	@bash push.sh
