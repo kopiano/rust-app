@@ -56,7 +56,7 @@ sqlx migrate run
 ```
 
 
-### router
+### tree 参考
 ```
 src/
 ├── database/
@@ -78,4 +78,52 @@ src/
 ├── state.rs             # AppState
 ├── app.rs               # Router 配置
 └── main.rs              # 程序入口
+```
+
+```shell
+.
+|
+├── src
+│       ├── app
+│       │       ├── mod.rs
+│       │       ├── router.rs
+│       │       └── state.rs
+│       ├── config
+│       │       ├── jwt.rs
+│       │       ├── logger.rs
+│       │       └── mod.rs
+│       ├── database
+│       │       ├── mod.rs
+│       │       ├── postgres.rs
+│       │       └── redis.rs
+│       ├── handles
+│       │       ├── auth.rs
+│       │       ├── mod.rs
+│       │       ├── task.rs
+│       │       └── user.rs
+│       ├── main.rs
+│       ├── middleware
+│       │       ├── cors.rs
+│       │       ├── jwt.rs
+│       │       ├── logger.rs
+│       │       └── mod.rs
+│       └── models
+│             ├── mod.rs
+│             ├── task.rs
+│             └── user.rs
+|
+├── migrations
+│       ├── 20260711113801_create_user_table.sql
+│       ├── 20260711113900_add_password_to_user.sql
+│       └── 20260711114000_create_task_table.sql
+├── push.sh
+├── API.md
+├── Cargo.lock
+├── Cargo.toml
+├── Claude.md
+├── LICENSE
+├── Makefile
+├── README.md
+├── docker-compose.yml
+└── target
 ```
