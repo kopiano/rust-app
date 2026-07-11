@@ -10,13 +10,16 @@ use crate::database::{postgres, redis};
 
 #[tokio::main]
 async fn main() {
+    // logger
     logger::init_tracing();
+    // .env
     dotenvy::dotenv().ok();
-
+    // jwt
     let jwt = jwt::JwtConfig::from_env();
+    // postgresql, redis
     let pool = postgres::connect().await;
     let redis = redis::connect().await;
-
+    // state
     let state = app::AppState {
         db: pool,
         redis,
@@ -24,7 +27,11 @@ async fn main() {
         jwt_max_age: jwt.max_age,
     };
 
+    // router
+    let app = app::router::create_router(state);
+    // port
     let listener = tokio::net::TcpListener::bind("0.0.0.0:2026").await.unwrap();
     tracing::info!("Server is running on http://localhost:2026");
-    axum::serve(listener, app::router::create_router(state)).await.unwrap();
+    // run axum web server
+    axum::serve(listener, app).await.unwrap();
 }
