@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="SqlDialectMappings">
+    <file url="file://$PROJECT_DIR$/migrations/20260711113801_create_user_table.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/migrations/20260711113900_add_password_to_user.sql" dialect="GenericSQL" />
+  </component>
+</project>

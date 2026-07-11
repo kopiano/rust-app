@@ -1,0 +1,24 @@
+services:
+  postgres:
+    image: postgres:18
+    container_name: kopiano-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: rust_app
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql     # v18
+
+  redis:
+    image: redis:8
+    container_name: kopiano-redis
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
