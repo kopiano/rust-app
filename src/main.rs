@@ -30,8 +30,8 @@ async fn main() {
     // router
     let app = app::router::create_router(state);
     // port
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:2026").await.unwrap();
-    tracing::info!("Server is running on http://localhost:2026");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8100").await.unwrap();
+    tracing::info!("Server is running on http://localhost:8100");
     // run axum web server
     axum::serve(listener, app).await.unwrap();
 }

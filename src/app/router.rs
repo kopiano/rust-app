@@ -6,7 +6,9 @@ use crate::middleware::{cors, jwt, logger};
 pub fn create_router(state: AppState) -> Router {
     let auth_api = Router::new()
         .route("/api/auth/register", post(auth::register))
-        .route("/api/auth/login", post(auth::login));
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/me", get(auth::me))
+        .route_layer(middleware::from_fn_with_state(state.clone(), jwt::require_auth));
 
     let user_api = Router::new()
         .route("/api/user", get(user::list).post(user::create))
