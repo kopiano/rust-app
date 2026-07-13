@@ -1,16 +1,38 @@
 use axum::{
+    Extension,
     Json,
     extract::{Path, State},
     http::StatusCode,
 };
 use uuid::Uuid;
 
+use crate::middleware::jwt::Claims;
 use crate::app::AppState;
 use crate::models::user::{CreateUser, UpdateUser, User};
 
+pub async fn me(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<User>, StatusCode> {
+    let id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let user = sqlx::query_as::<_, User>(
+        r##"SELECT id, name, email, github_id, password_hash, created_at, updated_at
+            FROM "user" WHERE id = $1"##,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(user))
+}
+
 pub async fn list(State(state): State<AppState>) -> Result<Json<Vec<User>>, StatusCode> {
     sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, password_hash, created_at, updated_at FROM "user" ORDER BY created_at DESC"##,
+        r##"SELECT id, name, email, github_id, password_hash, created_at, updated_at FROM "user" ORDER BY created_at DESC"##,
     )
     .fetch_all(&state.db)
     .await
@@ -23,7 +45,7 @@ pub async fn get_by_id(
     Path(id): Path<Uuid>,
 ) -> Result<Json<User>, StatusCode> {
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, password_hash, created_at, updated_at FROM "user" WHERE id = $1"##,
+        r##"SELECT id, name, email, github_id, password_hash, created_at, updated_at FROM "user" WHERE id = $1"##,
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -39,7 +61,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<User>), StatusCode> {
     sqlx::query_as::<_, User>(
         r##"INSERT INTO "user" (name, email) VALUES ($1, $2)
-         RETURNING id, name, email, password_hash, created_at, updated_at"##,
+         RETURNING id, name, email, github_id, password_hash, created_at, updated_at"##,
     )
     .bind(&input.name)
     .bind(&input.email)
@@ -60,7 +82,7 @@ pub async fn update(
                email = COALESCE($3, email),
                updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, email, password_hash, created_at, updated_at"##,
+            RETURNING id, name, email, github_id, password_hash, created_at, updated_at"##,
     )
     .bind(id)
     .bind(&input.name)

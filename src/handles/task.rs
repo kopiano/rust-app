@@ -9,7 +9,10 @@ use crate::app::AppState;
 use crate::middleware::jwt::Claims;
 use crate::models::task::{CreateTask, Task, UpdateTask};
 
-pub async fn list(State(state): State<AppState>, Extension(claims): Extension<Claims>) -> Result<Json<Vec<Task>>, StatusCode> {
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<Vec<Task>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let tasks = sqlx::query_as::<_, Task>(
         r##"SELECT id, user_id, title, completed, created_at, updated_at FROM "task" WHERE user_id = $1 ORDER BY created_at DESC"##,

@@ -6,8 +6,17 @@ use tower_http::cors::CorsLayer;
 
 pub fn cors() -> CorsLayer {
     CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_origin([
+            "http://localhost:1420".parse::<HeaderValue>().unwrap(),
+            "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+        ])
         .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE, USER_AGENT])
         .allow_credentials(true)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
 }

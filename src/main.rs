@@ -25,6 +25,13 @@ async fn main() {
         redis,
         jwt_secret: jwt.secret,
         jwt_max_age: jwt.max_age,
+        frontend_url: std::env::var("FRONTEND_URL")
+            .unwrap_or_else(|_| "http://localhost:1420".to_string()),
+        github_client_id: std::env::var("GITHUB_CLIENT_ID").expect("GITHUB_CLIENT_ID not found"),
+        github_client_secret: std::env::var("GITHUB_CLIENT_SECRET")
+            .expect("GITHUB_CLIENT_SECRET not found"),
+        github_redirect_uri: std::env::var("GITHUB_REDIRECT_URI")
+            .unwrap_or_else(|_| "http://localhost:8100/api/auth/github/callback".to_string()),
     };
 
     // router
