@@ -39,7 +39,7 @@ pub struct RegisterInput {
 
 #[derive(Debug, Deserialize)]
 pub struct LoginInput {
-    pub email: String,
+    pub username: String,
     pub password: String,
 }
 

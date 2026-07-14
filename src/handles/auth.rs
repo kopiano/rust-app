@@ -12,43 +12,76 @@ use crate::app::AppState;
 use crate::middleware::jwt;
 use crate::models::user::{AuthResponse, LoginInput, RegisterInput, User};
 
+// Used for unknown users so the response path still performs bcrypt verification.
+const DUMMY_PASSWORD_HASH: &str =
+    "$2b$12$C6UzMDM.H6dfI/f/IKcEe.VuQ7W8tM2aJ9Qm7Qy1w8M7QxN3S8G6";
+
 pub async fn register(
     State(state): State<AppState>,
     Json(input): Json<RegisterInput>,
-) -> Result<(StatusCode, Json<AuthResponse>), StatusCode> {
+) -> Result<Response, StatusCode> {
+    let name = input.name.trim();
+    let email = input.email.trim();
+    if name.is_empty()
+        || email.is_empty()
+        || input.password.trim().is_empty()
+        || !email.contains('@')
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let hash = bcrypt::hash(&input.password, bcrypt::DEFAULT_COST)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user = sqlx::query_as::<_, User>(
-        r##"INSERT INTO "user" (name, email, password_hash) VALUES ($1, $2, $3)
+        r##"INSERT INTO "user" (name, email, password_hash, last_login_at, status)
+         VALUES ($1, $2, $3, NOW(), TRUE)
          RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
     )
-    .bind(&input.name)
-    .bind(&input.email)
+    .bind(name)
+    .bind(email)
     .bind(&hash)
     .fetch_one(&state.db)
     .await
-    .map_err(|_| StatusCode::CONFLICT)?;
+    .map_err(|error| {
+        tracing::error!(%error, "User registration insert failed");
+        match &error {
+            sqlx::Error::Database(database_error)
+                if database_error.constraint() == Some("user_email_key")
+                    || database_error.constraint() == Some("user_name_unique") =>
+            {
+                StatusCode::CONFLICT
+            }
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    })?;
     let token = jwt::sign(&user.id.to_string(), &state.jwt_secret, state.jwt_max_age)?;
-    Ok((StatusCode::CREATED, Json(AuthResponse { token, user })))
+    Ok(auth_response(
+        StatusCode::CREATED,
+        AuthResponse { token: token.clone(), user },
+        token,
+    ))
 }
 
 pub async fn login(
     State(state): State<AppState>,
     Json(input): Json<LoginInput>,
-) -> Result<Json<AuthResponse>, StatusCode> {
+) -> Result<Response, StatusCode> {
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" WHERE email = $1"##,
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
     )
-    .bind(&input.email)
+    .bind(input.username)
     .fetch_optional(&state.db)
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::UNAUTHORIZED)?;
-    let valid = bcrypt::verify(&input.password, &user.password_hash)
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let password_hash = user
+        .as_ref()
+        .map(|user| user.password_hash.as_str())
+        .unwrap_or(DUMMY_PASSWORD_HASH);
+    let valid = bcrypt::verify(&input.password, password_hash)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !valid {
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    let user = match (user, valid) {
+        (Some(user), true) => user,
+        _ => return Err(StatusCode::UNAUTHORIZED),
+    };
     let user = sqlx::query_as::<_, User>(
         r##"UPDATE "user" SET last_login_at = NOW(), status = TRUE, updated_at = NOW()
             WHERE id = $1
@@ -59,7 +92,23 @@ pub async fn login(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let token = jwt::sign(&user.id.to_string(), &state.jwt_secret, state.jwt_max_age)?;
-    Ok(Json(AuthResponse { token, user }))
+    Ok(auth_response(
+        StatusCode::OK,
+        AuthResponse { token: token.clone(), user },
+        token,
+    ))
+}
+
+fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "Set-Cookie",
+        HeaderValue::from_str(&format!(
+            "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=3600"
+        ))
+        .expect("JWT cookie value must be a valid header value"),
+    );
+    (status, headers, Json(body)).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,7 +163,7 @@ pub async fn github_callback(
             response.headers_mut().append(
                 "Set-Cookie",
                 HeaderValue::from_str(&format!(
-                    "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=3600"
+                    "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=3600"
                 )).unwrap(),
             );
             response
@@ -283,7 +332,7 @@ pub async fn logout(
     response.headers_mut().append(
         "Set-Cookie",
         HeaderValue::from_static(
-            "auth_token=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0",
+        "auth_token=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0",
         ),
     );
     Ok(response)

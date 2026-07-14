@@ -40,7 +40,17 @@
     }                                                                                                                                                                    
 }
 ```
-409 Conflict — 邮箱已存在  
+
+- 注册重复用户名或邮箱返回明确的 409
+- 注册数据库异常记录日志并返回 500
+- 校验 name、email、password
+- 密码使用 bcrypt 加密
+- 写入 user 表
+- 返回 JWT 和用户信息
+- 设置登录 Cookie
+- 注册成功后写入：
+    - last_login_at = NOW()
+    - status = TRUE
 
 **login**
 登录 POST /api/auth/login

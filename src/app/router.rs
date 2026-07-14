@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::handles::{auth, task, user};
+use crate::handles::{auth, message, task, user};
 use crate::middleware::{cors, jwt, logger};
 use axum::{
     Router, middleware,
@@ -10,6 +10,7 @@ pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .merge(auth_api())
         .merge(user_api(state.clone()))
+        .merge(message_api(state.clone()))
         .merge(task_api(state.clone()));
 
     Router::new()
@@ -47,5 +48,11 @@ fn task_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/task", get(task::list).post(task::create))
         .route("/task/{id}", get(task::get_by_id).put(task::update).delete(task::delete))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
+}
+
+fn message_api(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/message/user_info", get(message::user_info))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
