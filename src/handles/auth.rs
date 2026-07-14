@@ -29,7 +29,10 @@ pub async fn register(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    let hash = bcrypt::hash(&input.password, bcrypt::DEFAULT_COST)
+    let password = input.password.clone();
+    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user = sqlx::query_as::<_, User>(
         r##"INSERT INTO "user" (name, email, password_hash, last_login_at, status)
