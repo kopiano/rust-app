@@ -15,4 +15,4 @@ run:
 	@cargo run
 
 cloud:
-	@cloudflared tunnel --config ~/.cloudflared/rust-app.yml run rust-app
+	@cloudflared tunnel --config ~/.cloudflared/rust-app.yml --protocol http2 run rust-app
