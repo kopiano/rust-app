@@ -13,6 +13,8 @@
 * Authentication：JWT
 * Configuration：dotenvy
 * Logging：tracing
+* cookie保存jwt
+
 
 ### install
 * 未创建项目目录

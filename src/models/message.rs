@@ -23,10 +23,22 @@ pub struct Message {
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct MessageUserInfo {
+    pub user_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
+    pub chat_type: String,
+    pub avatar: Option<String>,
+    pub username: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<bool>,
+    pub content: Option<String>,
+    pub last_message_time: Option<DateTime<Utc>>,
+    pub members: sqlx::types::Json<Vec<ChatMemberInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct ChatMemberInfo {
     pub user_id: Uuid,
     pub avatar: Option<String>,
     pub username: String,
     pub status: bool,
-    pub content: Option<String>,
-    pub last_message_time: Option<DateTime<Utc>>,
 }

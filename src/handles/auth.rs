@@ -1,9 +1,10 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
 };
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use rand::{Rng, distr::Alphanumeric};
 use redis::AsyncCommands;
 use serde::Deserialize;
@@ -128,17 +129,18 @@ pub async fn login(
 }
 
 fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "Set-Cookie",
-        HeaderValue::from_str(&format!(
-            "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800"
-        ))
-        .expect("JWT cookie value must be a valid header value"),
-    );
+    let cookie = Cookie::build(("access_token", token))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(time::Duration::days(7))
+        .build();
+    let jar = CookieJar::new().add(cookie);
+
     (
         status,
-        headers,
+        jar,
         Json(ApiResponse::success(body)),
     )
         .into_response()
@@ -192,14 +194,14 @@ pub async fn github_callback(
     let frontend_url = state.frontend_url.trim_end_matches('/').to_owned();
     match github_callback_inner(state, query).await {
         Ok((redirect, token)) => {
-            let mut response = redirect.into_response();
-            response.headers_mut().append(
-                "Set-Cookie",
-                HeaderValue::from_str(&format!(
-                    "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800"
-                )).unwrap(),
-            );
-            response
+            let cookie = Cookie::build(("access_token", token))
+                .http_only(true)
+                .secure(true)
+                .same_site(SameSite::Lax)
+                .path("/")
+                .max_age(time::Duration::days(7))
+                .build();
+            (CookieJar::new().add(cookie), redirect).into_response()
         }
         Err(status) => {
             tracing::error!(%status, "GitHub OAuth callback failed");
@@ -361,18 +363,19 @@ pub async fn logout(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
     }
-    let mut response = (
+    let cookie = Cookie::build(("access_token", ""))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .max_age(time::Duration::ZERO)
+        .build();
+    Ok((
         StatusCode::OK,
+        CookieJar::new().add(cookie),
         Json(ApiResponse::success(())),
-    )
-        .into_response();
-    response.headers_mut().append(
-        "Set-Cookie",
-        HeaderValue::from_static(
-        "auth_token=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0",
-        ),
-    );
-    Ok(response)
+        )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]

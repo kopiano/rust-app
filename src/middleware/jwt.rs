@@ -56,7 +56,7 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
     let cookie_token = req.headers().get("Cookie").and_then(|value| {
         value.to_str().ok()?.split(';').find_map(|part| {
             let (name, token) = part.trim().split_once('=')?;
-            (name == "auth_token").then_some(token)
+            (name == "access_token").then_some(token)
         })
     });
     let token = header_token.or(cookie_token).ok_or(StatusCode::UNAUTHORIZED);
