@@ -17,8 +17,7 @@ $ cloudflared tunnel route dns rust-app app.coulsonzero.shop
 $ cargo run
 $ cloudflared tunnel --config ~/.cloudflared/rust-app.yml --protocol http2 run rust-app
 ```
-
-
+* notice: 需关闭vpn
 
 * 查看tunnel
 ```shell

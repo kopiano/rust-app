@@ -251,7 +251,7 @@ async fn github_callback_inner(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let redirect = Redirect::temporary(&format!(
-        "{}/oauth/success",
+        "{}/chat",
         state.frontend_url.trim_end_matches('/')
     ));
     Ok((redirect, jwt))
