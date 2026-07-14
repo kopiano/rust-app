@@ -8,7 +8,7 @@ pub fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin([
             "http://localhost:1420".parse::<HeaderValue>().unwrap(),
-            "http://localhost:3000".parse::<HeaderValue>().unwrap(),
+            "https://www.coulsonzero.shop".parse::<HeaderValue>().unwrap(),
         ])
         .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE, USER_AGENT])
         .allow_credentials(true)

@@ -18,6 +18,7 @@ async fn main() {
     let jwt = jwt::JwtConfig::from_env();
     // postgresql, redis
     let pool = postgres::connect().await;
+    sqlx::migrate!("./migrations").run(&pool).await.expect("Database migration failed");
     let redis = redis::connect().await;
     // state
     let state = app::AppState {

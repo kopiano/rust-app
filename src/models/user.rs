@@ -9,6 +9,9 @@ pub struct User {
     pub name: String,
     pub email: String,
     pub github_id: Option<String>,
+    pub avatar: Option<String>,
+    pub last_login_at: Option<DateTime<Utc>>,
+    pub status: bool,
     #[serde(skip)]
     pub password_hash: String,
     pub created_at: DateTime<Utc>,

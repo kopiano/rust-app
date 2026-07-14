@@ -37,18 +37,15 @@ fn auth_api() -> Router<AppState> {
 
 fn user_api(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/user", get(user::list).post(user::create))
-        .route("/user/{id}", get(user::get_by_id).put(user::update).delete(user::delete))
-        .route("/user/me", get(user::me))
+        .route("/users", get(user::list).post(user::create))
+        .route("/users/{id}", get(user::get_by_id).put(user::update).delete(user::delete))
+        .route("/users/me", get(user::me))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
 
 fn task_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/task", get(task::list).post(task::create))
-        .route(
-            "/task/{id}",
-            get(task::get_by_id).put(task::update).delete(task::delete),
-        )
+        .route("/task/{id}", get(task::get_by_id).put(task::update).delete(task::delete))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

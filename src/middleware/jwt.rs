@@ -47,15 +47,22 @@ fn verify(token: &str, secret: &str) -> Result<Claims, StatusCode> {
 }
 
 pub async fn require_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let token = req
+    let header_token = req
         .headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
+    let cookie_token = req.headers().get("Cookie").and_then(|value| {
+        value.to_str().ok()?.split(';').find_map(|part| {
+            let (name, token) = part.trim().split_once('=')?;
+            (name == "auth_token").then_some(token)
+        })
+    });
+    let token = header_token.or(cookie_token).ok_or(StatusCode::UNAUTHORIZED);
     let token = match token {
-        Some(t) => t,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
     };
 
     let claims = match verify(token, &state.jwt_secret) {
