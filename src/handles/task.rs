@@ -95,22 +95,22 @@ pub async fn delete(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
-) -> StatusCode {
+) -> Result<Json<ApiResponse<()>>, StatusCode> {
     let user_id: Uuid = match claims.sub.parse() {
         Ok(id) => id,
-        Err(_) => return StatusCode::UNAUTHORIZED,
+        Err(_) => return Err(StatusCode::UNAUTHORIZED),
     };
     sqlx::query(r##"DELETE FROM "task" WHERE id = $1 AND user_id = $2"##)
         .bind(id)
         .bind(user_id)
         .execute(&state.db)
         .await
-        .map(|result| {
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .and_then(|result| {
             if result.rows_affected() > 0 {
-                StatusCode::NO_CONTENT
+                Ok(Json(ApiResponse::success(())))
             } else {
-                StatusCode::NOT_FOUND
+                Err(StatusCode::NOT_FOUND)
             }
         })
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }

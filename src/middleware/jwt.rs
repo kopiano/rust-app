@@ -70,6 +70,8 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
         Err(resp) => return resp.into_response(),
     };
 
-    req.extensions_mut().insert(claims);
-    next.run(req).await
+    req.extensions_mut().insert(claims.clone());
+    let mut response = next.run(req).await;
+    response.extensions_mut().insert(claims);
+    response
 }

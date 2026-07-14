@@ -15,7 +15,7 @@ jsonwebtoken = "9"
 bcrypt = "0.16"
 dotenvy = "0.15"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tower-http = { version = "0.7.0", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"

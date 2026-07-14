@@ -132,7 +132,7 @@ fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Respo
     headers.insert(
         "Set-Cookie",
         HeaderValue::from_str(&format!(
-            "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=3600"
+            "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800"
         ))
         .expect("JWT cookie value must be a valid header value"),
     );
@@ -196,7 +196,7 @@ pub async fn github_callback(
             response.headers_mut().append(
                 "Set-Cookie",
                 HeaderValue::from_str(&format!(
-                    "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=3600"
+                    "auth_token={token}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=604800"
                 )).unwrap(),
             );
             response
@@ -361,7 +361,11 @@ pub async fn logout(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
+    let mut response = (
+        StatusCode::OK,
+        Json(ApiResponse::success(())),
+    )
+        .into_response();
     response.headers_mut().append(
         "Set-Cookie",
         HeaderValue::from_static(
@@ -379,7 +383,7 @@ pub struct RefreshInput {
 pub async fn refresh(
     State(state): State<AppState>,
     Json(input): Json<RefreshInput>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<ApiResponse<serde_json::Value>>, StatusCode> {
     let mut redis = state.redis.clone();
     let user_id: Option<String> = redis
         .get(format!("refresh:{}", input.refresh_token))
@@ -387,5 +391,5 @@ pub async fn refresh(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user_id = user_id.ok_or(StatusCode::UNAUTHORIZED)?;
     let token = jwt::sign(&user_id, &state.jwt_secret, state.jwt_max_age)?;
-    Ok(Json(serde_json::json!({ "token": token })))
+    Ok(Json(ApiResponse::success(serde_json::json!({ "token": token }))))
 }

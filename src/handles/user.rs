@@ -98,17 +98,20 @@ pub async fn update(
     .map(|user| Json(ApiResponse::success(user)))
 }
 
-pub async fn delete(State(state): State<AppState>, Path(id): Path<Uuid>) -> StatusCode {
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<()>>, StatusCode> {
     sqlx::query(r##"DELETE FROM "user" WHERE id = $1"##)
         .bind(id)
         .execute(&state.db)
         .await
-        .map(|result| {
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+        .and_then(|result| {
             if result.rows_affected() > 0 {
-                StatusCode::NO_CONTENT
+                Ok(Json(ApiResponse::success(())))
             } else {
-                StatusCode::NOT_FOUND
+                Err(StatusCode::NOT_FOUND)
             }
         })
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
