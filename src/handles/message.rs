@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
+    common::response::ApiResponse,
     middleware::jwt::Claims,
     models::message::MessageUserInfo,
 };
@@ -14,7 +15,7 @@ use crate::{
 pub async fn user_info(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Vec<MessageUserInfo>>, StatusCode> {
+) -> Result<Json<ApiResponse<Vec<MessageUserInfo>>>, StatusCode> {
     let user_id = claims
         .sub
         .parse::<Uuid>()
@@ -75,5 +76,5 @@ pub async fn user_info(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(contacts))
+    Ok(Json(ApiResponse::success(contacts)))
 }

@@ -6,13 +6,14 @@ use axum::{
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::common::response::ApiResponse;
 use crate::middleware::jwt::Claims;
 use crate::models::task::{CreateTask, Task, UpdateTask};
 
 pub async fn list(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<Vec<Task>>, StatusCode> {
+) -> Result<Json<ApiResponse<Vec<Task>>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let tasks = sqlx::query_as::<_, Task>(
         r##"SELECT id, user_id, title, completed, created_at, updated_at FROM "task" WHERE user_id = $1 ORDER BY created_at DESC"##,
@@ -22,14 +23,14 @@ pub async fn list(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(Json(tasks))
+    Ok(Json(ApiResponse::success(tasks)))
 }
 
 pub async fn get_by_id(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Task>, StatusCode> {
+) -> Result<Json<ApiResponse<Task>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let task = sqlx::query_as::<_, Task>(
         r##"SELECT id, user_id, title, completed, created_at, updated_at FROM "task" WHERE id = $1 AND user_id = $2"##,
@@ -41,14 +42,14 @@ pub async fn get_by_id(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(task))
+    Ok(Json(ApiResponse::success(task)))
 }
 
 pub async fn create(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     Json(input): Json<CreateTask>,
-) -> Result<(StatusCode, Json<Task>), StatusCode> {
+) -> Result<(StatusCode, Json<ApiResponse<Task>>), StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let task = sqlx::query_as::<_, Task>(
         r##"INSERT INTO "task" (user_id, title) VALUES ($1, $2)
@@ -60,7 +61,7 @@ pub async fn create(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok((StatusCode::CREATED, Json(task)))
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(task))))
 }
 
 pub async fn update(
@@ -68,7 +69,7 @@ pub async fn update(
     Extension(claims): Extension<Claims>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateTask>,
-) -> Result<Json<Task>, StatusCode> {
+) -> Result<Json<ApiResponse<Task>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     let task = sqlx::query_as::<_, Task>(
         r##"UPDATE "task" SET
@@ -87,7 +88,7 @@ pub async fn update(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    Ok(Json(task))
+    Ok(Json(ApiResponse::success(task)))
 }
 
 pub async fn delete(

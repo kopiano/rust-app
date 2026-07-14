@@ -9,12 +9,14 @@ use redis::AsyncCommands;
 use serde::Deserialize;
 
 use crate::app::AppState;
+use crate::common::response::ApiResponse;
 use crate::middleware::jwt;
 use crate::models::user::{AuthResponse, LoginInput, RegisterInput, User};
 
 // Used for unknown users so the response path still performs bcrypt verification.
 const DUMMY_PASSWORD_HASH: &str =
-    "$2b$12$C6UzMDM.H6dfI/f/IKcEe.VuQ7W8tM2aJ9Qm7Qy1w8M7QxN3S8G6";
+    "$2y$08$mnpm4SdYbuv8jY6GBq5DxOeLZWTbhoyhFStR7UclYBrbt0pCQ6SYC";
+const BCRYPT_COST: u32 = 8;
 
 pub async fn register(
     State(state): State<AppState>,
@@ -30,7 +32,7 @@ pub async fn register(
         return Err(StatusCode::BAD_REQUEST);
     }
     let password = input.password.clone();
-    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, bcrypt::DEFAULT_COST))
+    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, BCRYPT_COST))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -68,32 +70,55 @@ pub async fn login(
     State(state): State<AppState>,
     Json(input): Json<LoginInput>,
 ) -> Result<Response, StatusCode> {
+    // check
+    let username = input.username.trim();
+    if username.is_empty() || input.password.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(400, "Invalid username or password")),
+        )
+            .into_response());
+    }
+    // sql
     let user = sqlx::query_as::<_, User>(
         r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
     )
-    .bind(input.username)
+    .bind(username)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let password_hash = user
         .as_ref()
-        .map(|user| user.password_hash.as_str())
-        .unwrap_or(DUMMY_PASSWORD_HASH);
-    let valid = bcrypt::verify(&input.password, password_hash)
+        .map(|user| user.password_hash.clone())
+        .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_owned());
+    let password = input.password.clone();
+    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(password, &password_hash))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user = match (user, valid) {
         (Some(user), true) => user,
-        _ => return Err(StatusCode::UNAUTHORIZED),
+        _ => {
+            return Ok((
+                StatusCode::UNAUTHORIZED,
+                Json(ApiResponse::<()>::error(
+                    401,
+                    "Invalid username or password",
+                )),
+            )
+                .into_response());
+        }
     };
-    let user = sqlx::query_as::<_, User>(
-        r##"UPDATE "user" SET last_login_at = NOW(), status = TRUE, updated_at = NOW()
-            WHERE id = $1
-            RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
-    )
-    .bind(user.id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let pool = state.db.clone();
+    tokio::spawn(async move {
+        let _ = sqlx::query(
+            r##"UPDATE "user" SET last_login_at = NOW() WHERE id = $1"##,
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await;
+    });
+    // token
     let token = jwt::sign(&user.id.to_string(), &state.jwt_secret, state.jwt_max_age)?;
     Ok(auth_response(
         StatusCode::OK,
@@ -111,7 +136,12 @@ fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Respo
         ))
         .expect("JWT cookie value must be a valid header value"),
     );
-    (status, headers, Json(body)).into_response()
+    (
+        status,
+        headers,
+        Json(ApiResponse::success(body)),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

@@ -127,3 +127,18 @@ src/
 ├── docker-compose.yml
 └── target
 ```
+
+## 接口性能优化
+### login
+* bcrypt校验耗时严重，降低cost。
+```rust
+const BCRYPT_COST: u32 = 8;
+```
+* 使用 Tokio 的阻塞线程池
+```rust
+let is_valid = tokio::task::spawn_blocking(move || {
+    bcrypt::verify(password, &hash)
+})
+.await??;
+```
+

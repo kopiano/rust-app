@@ -82,6 +82,14 @@
 }
 ```
 401 Unauthorized — 邮箱或密码错误
+登录bcrypt校验耗时很高，const BCRYPT_COST: u32 = 8;极大降低耗时
+| Cost |       大致耗时 |
+| ---- | ---------: |
+| 8    |   20–40 ms |
+| 10   |  50–120 ms |
+| 12   | 150–400 ms |
+| 14   | 500 ms–1 s |
+
 
 **me**
 GET /api/auth/me          
