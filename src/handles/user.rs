@@ -23,7 +23,7 @@ pub async fn me(
         .parse::<Uuid>()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at
             FROM "user" WHERE id = $1"##,
     )
     .bind(id)
@@ -38,7 +38,7 @@ pub async fn list(
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<Vec<User>>>, StatusCode> {
     sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" ORDER BY created_at DESC"##,
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at FROM "user" ORDER BY created_at DESC"##,
     )
     .fetch_all(&state.db)
     .await
@@ -51,7 +51,7 @@ pub async fn get_by_id(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<User>>, StatusCode> {
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" WHERE id = $1"##,
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at FROM "user" WHERE id = $1"##,
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -68,7 +68,7 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<ApiResponse<User>>), StatusCode> {
     sqlx::query_as::<_, User>(
         r##"INSERT INTO "user" (name, email) VALUES ($1, $2)
-         RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
+         RETURNING id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at"##,
     )
     .bind(&input.name)
     .bind(&input.email)
@@ -89,7 +89,7 @@ pub async fn update(
                email = COALESCE($3, email),
                updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
+            RETURNING id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at"##,
     )
     .bind(id)
     .bind(&input.name)
@@ -118,7 +118,7 @@ pub async fn profile(
     }
 
     let current = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at
             FROM "user" WHERE id = $1"##,
     )
     .bind(user_id)
@@ -176,7 +176,7 @@ pub async fn profile(
                password_hash = $4,
                updated_at = NOW()
             WHERE id = $1
-            RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
+            RETURNING id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at"##,
     )
     .bind(user_id)
     .bind(username)

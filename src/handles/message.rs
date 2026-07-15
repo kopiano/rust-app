@@ -6,8 +6,12 @@ use axum::{
     response::IntoResponse,
 };
 use image::ImageFormat;
+use redis::AsyncCommands;
 use serde::Deserialize;
-use std::io::Cursor;
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -16,6 +20,56 @@ use crate::{
     middleware::jwt::Claims,
     models::message::{Message, MessageBroadcast, MessageUserInfo, SendMessageRequest},
 };
+
+const ONLINE_TTL_SECONDS: u64 = 60;
+
+#[derive(Debug, Deserialize)]
+struct WebSocketClientEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+}
+
+async fn refresh_online_status(state: &AppState, user_id: Uuid) -> redis::RedisResult<()> {
+    let mut redis = state.redis.clone();
+    redis
+        .set_ex(format!("online:{user_id}"), "1", ONLINE_TTL_SECONDS)
+        .await
+}
+
+async fn load_online_statuses(
+    state: &AppState,
+    user_ids: &HashSet<Uuid>,
+) -> HashMap<Uuid, bool> {
+    if user_ids.is_empty() {
+        return HashMap::new();
+    }
+
+    let user_ids = user_ids.iter().copied().collect::<Vec<_>>();
+    let keys = user_ids
+        .iter()
+        .map(|user_id| format!("online:{user_id}"))
+        .collect::<Vec<_>>();
+    let mut redis = state.redis.clone();
+    let values = redis::cmd("MGET")
+        .arg(&keys)
+        .query_async::<Vec<Option<String>>>(&mut redis)
+        .await;
+
+    match values {
+        Ok(values) => user_ids
+            .into_iter()
+            .zip(values)
+            .map(|(user_id, value)| (user_id, value.is_some()))
+            .collect(),
+        Err(error) => {
+            tracing::error!(%error, "Failed to load online presence from Redis");
+            user_ids
+                .into_iter()
+                .map(|user_id| (user_id, false))
+                .collect()
+        }
+    }
+}
 
 pub async fn send(
     State(state): State<AppState>,
@@ -502,6 +556,10 @@ pub async fn websocket(
 async fn websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid) {
     let mut messages = state.message_tx.subscribe();
 
+    if let Err(error) = refresh_online_status(&state, user_id).await {
+        tracing::error!(%error, %user_id, "Failed to initialize online presence");
+    }
+
     loop {
         tokio::select! {
             event = messages.recv() => {
@@ -522,7 +580,29 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(WsMessage::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(WsMessage::Text(payload))) => {
+                        let is_heartbeat = serde_json::from_str::<WebSocketClientEvent>(&payload)
+                            .is_ok_and(|event| event.event_type == "heartbeat");
+                        if is_heartbeat
+                            && let Err(error) = refresh_online_status(&state, user_id).await
+                        {
+                            tracing::error!(%error, %user_id, "Failed to refresh online presence");
+                        }
+                    }
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if let Err(error) = refresh_online_status(&state, user_id).await {
+                            tracing::error!(%error, %user_id, "Failed to refresh online presence");
+                        }
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Pong(_))) => {
+                        if let Err(error) = refresh_online_status(&state, user_id).await {
+                            tracing::error!(%error, %user_id, "Failed to refresh online presence");
+                        }
+                    }
+                    Some(Ok(WsMessage::Binary(_))) => {}
                     Some(Err(_)) => break,
                 }
             }
@@ -539,7 +619,7 @@ pub async fn user_info(
         .parse::<Uuid>()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
 
-    let contacts = sqlx::query_as::<_, MessageUserInfo>(
+    let mut contacts = sqlx::query_as::<_, MessageUserInfo>(
         r##"
         WITH private_latest AS (
             SELECT DISTINCT ON (
@@ -584,7 +664,7 @@ pub async fn user_info(
             'private' AS chat_type,
             u.avatar,
             u.name AS username,
-            u.status,
+            FALSE AS online,
             pl.content,
             pl.last_message_time,
             '[]'::jsonb AS members
@@ -600,7 +680,7 @@ pub async fn user_info(
             'public' AS chat_type,
             c.avatar,
             c.name AS username,
-            NULL::boolean AS status,
+            NULL::boolean AS online,
             gl.content,
             gl.last_message_time,
             COALESCE((
@@ -608,7 +688,7 @@ pub async fn user_info(
                     'user_id', u.id,
                     'avatar', u.avatar,
                     'username', u.name,
-                    'status', u.status
+                    'online', false
                 ) ORDER BY u.name)
                 FROM group_member cm
                 JOIN "user" u ON u.id = cm.user_id
@@ -628,6 +708,34 @@ pub async fn user_info(
         tracing::error!(%error, %user_id, "Failed to load message contacts");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+
+    let user_ids = contacts
+        .iter()
+        .flat_map(|contact| {
+            contact
+                .user_id
+                .into_iter()
+                .chain(contact.members.0.iter().map(|member| member.user_id))
+        })
+        .collect::<HashSet<_>>();
+    let online_statuses = load_online_statuses(&state, &user_ids).await;
+
+    for contact in &mut contacts {
+        if let Some(contact_user_id) = contact.user_id {
+            contact.online = Some(
+                online_statuses
+                    .get(&contact_user_id)
+                    .copied()
+                    .unwrap_or(false),
+            );
+        }
+        for member in &mut contact.members.0 {
+            member.online = online_statuses
+                .get(&member.user_id)
+                .copied()
+                .unwrap_or(false);
+        }
+    }
 
     Ok(Json(ApiResponse::success(contacts)))
 }

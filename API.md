@@ -50,7 +50,6 @@
 - 设置登录 Cookie
 - 注册成功后写入：
     - last_login_at = NOW()
-    - status = TRUE
 
 **login**
 登录 POST /api/auth/login
@@ -162,7 +161,7 @@ Authorization: Bearer <token>
         "chat_type": "private",
         "avatar": "https://cdn.example.com/avatar/alice.png",
         "username": "Alice",
-        "status": true,
+        "online": true,
         "content": "晚上一起测试接口吗？",
         "last_message_time": "2026-07-14T21:20:11Z",
         "members": []
@@ -180,13 +179,13 @@ Authorization: Bearer <token>
             "user_id": "2c7f0f4d-9a1c-4e8b-a9d0-1f3b4e5c6a77",
             "avatar": "https://cdn.example.com/avatar/alice.png",
             "username": "Alice",
-            "status": true
+            "online": true
           },
           {
             "user_id": "9d4a6b21-6b1f-48e5-9bca-7f9c8a1d2e33",
             "avatar": "https://cdn.example.com/avatar/bob.png",
             "username": "Bob",
-            "status": false
+            "online": false
           }
         ]
       }
@@ -223,7 +222,6 @@ Content-Type: application/json
       "github_id": null,
       "avatar": "/api/assets/avatar/new-username-1752585600000.webp",
       "last_login_at": "2026-07-15T10:20:30Z",
-      "status": true,
       "created_at": "2026-07-01T08:00:00Z",
       "updated_at": "2026-07-15T10:25:00Z"
     }

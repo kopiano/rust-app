@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS "user" (
     github_id VARCHAR(255),
     avatar VARCHAR(2048),
     last_login_at TIMESTAMPTZ,
-    status BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

@@ -38,9 +38,9 @@ pub async fn register(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user = sqlx::query_as::<_, User>(
-        r##"INSERT INTO "user" (name, email, password_hash, last_login_at, status)
-         VALUES ($1, $2, $3, NOW(), TRUE)
-         RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##,
+        r##"INSERT INTO "user" (name, email, password_hash, last_login_at)
+         VALUES ($1, $2, $3, NOW())
+         RETURNING id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at"##,
     )
     .bind(name)
     .bind(email)
@@ -82,7 +82,7 @@ pub async fn login(
     }
     // sql
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
+        r##"SELECT id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
     )
     .bind(username)
     .fetch_optional(&state.db)
@@ -313,16 +313,15 @@ async fn github_callback_inner(
             })?,
     };
     let user = sqlx::query_as::<_, User>(r##"INSERT INTO "user"
-        (name, email, password_hash, github_id, avatar, last_login_at, status)
-        VALUES ($1, $2, $3, $4, $5, NOW(), TRUE)
+        (name, email, password_hash, github_id, avatar, last_login_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
         ON CONFLICT (email) DO UPDATE SET
             github_id = EXCLUDED.github_id,
             name = EXCLUDED.name,
             avatar = EXCLUDED.avatar,
             last_login_at = NOW(),
-            status = TRUE,
             updated_at = NOW()
-        RETURNING id, name, email, github_id, avatar, last_login_at, status, password_hash, created_at, updated_at"##)
+        RETURNING id, name, email, github_id, avatar, last_login_at, password_hash, created_at, updated_at"##)
         .bind(&github.login)
         .bind(&email)
         .bind("")
@@ -358,21 +357,10 @@ pub async fn logout(
 ) -> Result<Response, StatusCode> {
     if let Some(token) = headers.get("X-Refresh-Token").and_then(|v| v.to_str().ok()) {
         let mut redis = state.redis.clone();
-        let user_id: Option<String> = redis
-            .get(format!("refresh:{token}"))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let _: () = redis
             .del(format!("refresh:{token}"))
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if let Some(user_id) = user_id {
-            sqlx::query(r##"UPDATE "user" SET status = FALSE, updated_at = NOW() WHERE id = $1"##)
-                .bind(user_id.parse::<uuid::Uuid>().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
-                .execute(&state.db)
-                .await
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        }
     }
     let cookie = build_auth_cookie(String::new(), time::Duration::ZERO);
     Ok((
