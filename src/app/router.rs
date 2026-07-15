@@ -13,6 +13,8 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
 };
 
+const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .merge(auth_api())
@@ -99,7 +101,7 @@ fn message_api(state: AppState) -> Router<AppState> {
 
 fn moment_api(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/moment", post(moment::create).get(moment::list).layer(DefaultBodyLimit::max(305 * 1024 * 1024)))
+        .route("/moment", post(moment::create).get(moment::list).layer(DefaultBodyLimit::max(MAX_MOMENT_BODY_BYTES)))
         .route("/moment/{id}", get(moment::get))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

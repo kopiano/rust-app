@@ -12,6 +12,7 @@ pub struct Moment {
     pub content: Option<String>,
     pub media: Json<Vec<MomentMedia>>,
     pub processing_status: String,
+    pub processing_progress: i16,
     pub processing_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

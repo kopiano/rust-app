@@ -1,6 +1,7 @@
 use std::{
     io::Cursor,
     path::{Path, PathBuf},
+    process::Stdio,
 };
 
 use axum::{
@@ -10,7 +11,11 @@ use axum::{
 };
 use image::ImageFormat;
 use serde::Deserialize;
-use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::Command,
+    sync::Semaphore,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -22,13 +27,14 @@ use crate::{
 
 const MAX_CONTENT_CHARS: usize = 5_000;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_VIDEO_BYTES: usize = 300 * 1024 * 1024;
+const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const HLS_SEGMENT_SECONDS: &str = "6";
 static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 struct PendingVideo {
     source_path: PathBuf,
     output_directory: PathBuf,
+    duration_us: u64,
 }
 
 struct SavedMomentMedia {
@@ -40,6 +46,7 @@ struct SavedMomentMedia {
 #[derive(Deserialize)]
 struct VideoProbeOutput {
     streams: Vec<VideoProbeStream>,
+    format: Option<VideoProbeFormat>,
 }
 
 #[derive(Deserialize)]
@@ -60,6 +67,11 @@ struct VideoProbeTags {
 #[derive(Deserialize)]
 struct VideoProbeSideData {
     rotation: Option<i32>,
+}
+
+#[derive(Deserialize)]
+struct VideoProbeFormat {
+    duration: Option<String>,
 }
 
 pub async fn create(
@@ -148,14 +160,17 @@ pub async fn create(
     let result = sqlx::query_as::<_, Moment>(
         r#"
         WITH inserted AS (
-            INSERT INTO moment (user_id, content, media, processing_status)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, user_id, content, media, processing_status,
+            INSERT INTO moment (
+                user_id, content, media, processing_status, processing_progress
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id, user_id, content, media, processing_status, processing_progress,
                       processing_error, created_at, updated_at
         )
-        SELECT inserted.id, inserted.user_id, $5::text AS username,
-               $6::text AS avatar, inserted.content, inserted.media,
-               inserted.processing_status, inserted.processing_error,
+        SELECT inserted.id, inserted.user_id, $6::text AS username,
+               $7::text AS avatar, inserted.content, inserted.media,
+               inserted.processing_status, inserted.processing_progress,
+               inserted.processing_error,
                inserted.created_at, inserted.updated_at
         FROM inserted
         "#,
@@ -164,6 +179,11 @@ pub async fn create(
     .bind(content)
     .bind(sqlx::types::Json(media.into_iter().collect::<Vec<_>>()))
     .bind(processing_status)
+    .bind(if pending_video.is_some() {
+        0_i16
+    } else {
+        100_i16
+    })
     .bind(username)
     .bind(avatar)
     .fetch_one(&state.db)
@@ -195,7 +215,8 @@ pub async fn list(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
                "user".avatar, moment.content, moment.media,
-               moment.processing_status, moment.processing_error,
+               moment.processing_status, moment.processing_progress,
+               moment.processing_error,
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
@@ -221,7 +242,8 @@ pub async fn get(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
                "user".avatar, moment.content, moment.media,
-               moment.processing_status, moment.processing_error,
+               moment.processing_status, moment.processing_progress,
+               moment.processing_error,
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
@@ -309,8 +331,8 @@ async fn save_moment_media(
                 cleanup_saved_path(Some(&video_directory)).await;
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
-            let (width, height) = match probe_video_dimensions(&source_path).await {
-                Ok(dimensions) => dimensions,
+            let (width, height, duration_us) = match probe_video_metadata(&source_path).await {
+                Ok(metadata) => metadata,
                 Err(status) => {
                     cleanup_saved_path(Some(&video_directory)).await;
                     return Err(status);
@@ -331,6 +353,7 @@ async fn save_moment_media(
                 pending_video: Some(PendingVideo {
                     source_path,
                     output_directory: video_directory,
+                    duration_us,
                 }),
             })
         }
@@ -338,7 +361,7 @@ async fn save_moment_media(
     }
 }
 
-async fn probe_video_dimensions(source_path: &Path) -> Result<(u32, u32), StatusCode> {
+async fn probe_video_metadata(source_path: &Path) -> Result<(u32, u32, u64), StatusCode> {
     let ffprobe = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_owned());
     let output = Command::new(&ffprobe)
         .args([
@@ -347,7 +370,7 @@ async fn probe_video_dimensions(source_path: &Path) -> Result<(u32, u32), Status
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+            "stream=width,height:stream_tags=rotate:stream_side_data=rotation:format=duration",
             "-of",
             "json",
         ])
@@ -369,18 +392,23 @@ async fn probe_video_dimensions(source_path: &Path) -> Result<(u32, u32), Status
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    parse_video_dimensions(&output.stdout).ok_or_else(|| {
-        tracing::error!("FFprobe did not return valid video dimensions");
+    parse_video_metadata(&output.stdout).ok_or_else(|| {
+        tracing::error!("FFprobe did not return valid video dimensions and duration");
         StatusCode::UNPROCESSABLE_ENTITY
     })
 }
 
-fn parse_video_dimensions(output: &[u8]) -> Option<(u32, u32)> {
+fn parse_video_metadata(output: &[u8]) -> Option<(u32, u32, u64)> {
     let probe = serde_json::from_slice::<VideoProbeOutput>(output).ok()?;
     let stream = probe.streams.first()?;
     if stream.width == 0 || stream.height == 0 {
         return None;
     }
+    let duration_seconds = probe.format?.duration?.parse::<f64>().ok()?;
+    if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
+        return None;
+    }
+    let duration_us = (duration_seconds * 1_000_000.0).round() as u64;
 
     let rotation = stream
         .tags
@@ -392,15 +420,22 @@ fn parse_video_dimensions(output: &[u8]) -> Option<(u32, u32)> {
         .rem_euclid(360);
 
     if matches!(rotation, 90 | 270) {
-        Some((stream.height, stream.width))
+        Some((stream.height, stream.width, duration_us))
     } else {
-        Some((stream.width, stream.height))
+        Some((stream.width, stream.height, duration_us))
     }
 }
 
 fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVideo) {
     tokio::spawn(async move {
-        let result = transcode_video_to_hls(&pending.source_path, &pending.output_directory).await;
+        let result = transcode_video_to_hls(
+            &db,
+            moment_id,
+            &pending.source_path,
+            &pending.output_directory,
+            pending.duration_us,
+        )
+        .await;
         let (status, processing_error) = match result {
             Ok(()) => ("ready", None),
             Err(error_status) => {
@@ -416,7 +451,10 @@ fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVid
         if let Err(error) = sqlx::query(
             r#"
             UPDATE moment
-            SET processing_status = $2, processing_error = $3, updated_at = NOW()
+            SET processing_status = $2,
+                processing_progress = CASE WHEN $2 = 'ready' THEN 100 ELSE processing_progress END,
+                processing_error = $3,
+                updated_at = NOW()
             WHERE id = $1
             "#,
         )
@@ -432,8 +470,11 @@ fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVid
 }
 
 async fn transcode_video_to_hls(
+    db: &sqlx::PgPool,
+    moment_id: Uuid,
     source_path: &Path,
     output_directory: &Path,
+    duration_us: u64,
 ) -> Result<(), StatusCode> {
     let _permit = VIDEO_TRANSCODE_SLOTS
         .acquire()
@@ -443,8 +484,19 @@ async fn transcode_video_to_hls(
     let playlist_path = output_directory.join("index.m3u8");
     let segment_pattern = output_directory.join("segment-%05d.ts");
 
-    let output = Command::new(&ffmpeg)
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+    let mut command = Command::new(&ffmpeg);
+    command
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            "-y",
+            "-i",
+        ])
         .arg(source_path)
         .args([
             "-map",
@@ -483,17 +535,56 @@ async fn transcode_video_to_hls(
         ])
         .arg(segment_pattern)
         .arg(playlist_path)
-        .output()
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg");
-            StatusCode::SERVICE_UNAVAILABLE
-        })?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut child = command.spawn().map_err(|error| {
+        tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let stderr_task = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        bytes
+    });
+
+    let mut lines = BufReader::new(stdout).lines();
+    let mut last_progress = 0_i16;
+    while let Some(line) = lines.next_line().await.map_err(|error| {
+        tracing::error!(%error, %moment_id, "Failed to read FFmpeg progress");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        let Some(out_time_us) = parse_ffmpeg_out_time_us(&line) else {
+            continue;
+        };
+        let progress = ((out_time_us.saturating_mul(99) / duration_us).min(99)) as i16;
+        if progress <= last_progress {
+            continue;
+        }
+        last_progress = progress;
+        update_processing_progress(db, moment_id, progress).await;
+    }
+
+    let status = child.wait().await.map_err(|error| {
+        tracing::error!(%error, %moment_id, "Failed to wait for FFmpeg");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         tracing::error!(
-            status = ?output.status.code(),
+            status = ?status.code(),
             error = %stderr.trim(),
             "FFmpeg HLS transcoding failed"
         );
@@ -503,6 +594,27 @@ async fn transcode_video_to_hls(
     generate_video_poster(&ffmpeg, source_path, output_directory).await?;
 
     Ok(())
+}
+
+fn parse_ffmpeg_out_time_us(line: &str) -> Option<u64> {
+    line.strip_prefix("out_time_us=")?.parse().ok()
+}
+
+async fn update_processing_progress(db: &sqlx::PgPool, moment_id: Uuid, progress: i16) {
+    if let Err(error) = sqlx::query(
+        r#"
+        UPDATE moment
+        SET processing_progress = GREATEST(processing_progress, $2)
+        WHERE id = $1 AND processing_status = 'processing'
+        "#,
+    )
+    .bind(moment_id)
+    .bind(progress)
+    .execute(db)
+    .await
+    {
+        tracing::warn!(%error, %moment_id, %progress, "Failed to save video processing progress");
+    }
 }
 
 async fn generate_video_poster(
@@ -709,8 +821,8 @@ fn video_extension(
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_moment_image, encode_video_poster, media_name_component, parse_video_dimensions,
-        video_extension,
+        encode_moment_image, encode_video_poster, media_name_component, parse_ffmpeg_out_time_us,
+        parse_video_metadata, video_extension,
     };
     use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
     use std::io::Cursor;
@@ -764,12 +876,27 @@ mod tests {
     }
 
     #[test]
-    fn reads_display_dimensions_from_ffprobe_output() {
-        let landscape = br#"{"streams":[{"width":1920,"height":1080}]}"#;
-        let portrait =
-            br#"{"streams":[{"width":1920,"height":1080,"side_data_list":[{"rotation":-90}]}]}"#;
+    fn reads_display_metadata_from_ffprobe_output() {
+        let landscape =
+            br#"{"streams":[{"width":1920,"height":1080}],"format":{"duration":"12.5"}}"#;
+        let portrait = br#"{"streams":[{"width":1920,"height":1080,"side_data_list":[{"rotation":-90}]}],"format":{"duration":"2.25"}}"#;
 
-        assert_eq!(parse_video_dimensions(landscape), Some((1920, 1080)));
-        assert_eq!(parse_video_dimensions(portrait), Some((1080, 1920)));
+        assert_eq!(
+            parse_video_metadata(landscape),
+            Some((1920, 1080, 12_500_000))
+        );
+        assert_eq!(
+            parse_video_metadata(portrait),
+            Some((1080, 1920, 2_250_000))
+        );
+    }
+
+    #[test]
+    fn parses_ffmpeg_progress_time() {
+        assert_eq!(
+            parse_ffmpeg_out_time_us("out_time_us=12500000"),
+            Some(12_500_000)
+        );
+        assert_eq!(parse_ffmpeg_out_time_us("progress=continue"), None);
     }
 }
