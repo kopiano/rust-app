@@ -20,12 +20,6 @@ CREATE TABLE IF NOT EXISTS "message" (
     )
 );
 
-CREATE INDEX IF NOT EXISTS message_send_id_idx
-    ON "message" (send_id);
-CREATE INDEX IF NOT EXISTS message_receiver_id_idx
-    ON "message" (receiver_id);
-CREATE INDEX IF NOT EXISTS message_conversation_created_at_idx
-    ON "message" (send_id, receiver_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS message_group_latest_idx
     ON "message" (group_id, created_at DESC, id DESC)
     WHERE group_id IS NOT NULL AND deleted_at IS NULL;
