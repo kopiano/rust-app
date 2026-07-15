@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     io::Cursor,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Stdio,
 };
 
@@ -262,6 +263,42 @@ pub async fn get(
     Ok(Json(ApiResponse::success(moment)))
 }
 
+pub async fn delete(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ApiResponse<()>>, StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let deleted_media = sqlx::query_as::<_, (sqlx::types::Json<Vec<MomentMedia>>,)>(
+        r#"
+        DELETE FROM moment
+        WHERE id = $1 AND user_id = $2
+        RETURNING media
+        "#,
+    )
+    .bind(moment_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %moment_id, %user_id, "Failed to delete moment");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let cleanup_paths = moment_media_paths(&deleted_media.0.0);
+    tokio::spawn(async move {
+        for path in cleanup_paths {
+            cleanup_saved_path(Some(&path)).await;
+        }
+    });
+
+    Ok(Json(ApiResponse::success(())))
+}
+
 async fn save_moment_media(
     field: &mut Field<'_>,
     requested_media_type: Option<&str>,
@@ -448,7 +485,7 @@ fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVid
             }
         };
 
-        if let Err(error) = sqlx::query(
+        match sqlx::query(
             r#"
             UPDATE moment
             SET processing_status = $2,
@@ -464,7 +501,13 @@ fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVid
         .execute(&db)
         .await
         {
-            tracing::error!(%error, %moment_id, "Failed to update moment processing status");
+            Ok(result) if result.rows_affected() == 0 => {
+                cleanup_saved_path(Some(&pending.output_directory)).await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, %moment_id, "Failed to update moment processing status");
+            }
         }
     });
 }
@@ -747,6 +790,50 @@ async fn cleanup_saved_path(path: Option<&Path>) {
     }
 }
 
+fn moment_media_paths(media: &[MomentMedia]) -> Vec<PathBuf> {
+    const MEDIA_URL_PREFIX: &str = "/api/assets/moment/";
+    let media_root = Path::new("src/assets/moment");
+    let mut paths = HashSet::new();
+
+    for item in media {
+        let Some(relative_url) = item
+            .url
+            .split('?')
+            .next()
+            .and_then(|url| url.strip_prefix(MEDIA_URL_PREFIX))
+        else {
+            continue;
+        };
+
+        let mut relative_path = PathBuf::new();
+        let mut valid = true;
+        for component in Path::new(relative_url).components() {
+            match component {
+                Component::Normal(segment) => relative_path.push(segment),
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid || relative_path.as_os_str().is_empty() {
+            continue;
+        }
+
+        let cleanup_path = if item.media_type == "video" {
+            let Some(Component::Normal(directory)) = relative_path.components().next() else {
+                continue;
+            };
+            media_root.join(directory)
+        } else {
+            media_root.join(relative_path)
+        };
+        paths.insert(cleanup_path);
+    }
+
+    paths.into_iter().collect()
+}
+
 fn infer_media_type(content_type: Option<&str>) -> Option<&'static str> {
     match content_type {
         Some(value) if value.starts_with("image/") => Some("image"),
@@ -821,11 +908,49 @@ fn video_extension(
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_moment_image, encode_video_poster, media_name_component, parse_ffmpeg_out_time_us,
-        parse_video_metadata, video_extension,
+        encode_moment_image, encode_video_poster, media_name_component, moment_media_paths,
+        parse_ffmpeg_out_time_us, parse_video_metadata, video_extension,
     };
+    use crate::models::moment::MomentMedia;
     use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
-    use std::io::Cursor;
+    use std::{collections::HashSet, io::Cursor, path::PathBuf};
+
+    #[test]
+    fn resolves_safe_moment_media_cleanup_paths() {
+        let media = vec![
+            MomentMedia {
+                media_type: "image".to_owned(),
+                url: "/api/assets/moment/moment-user.webp".to_owned(),
+                poster_url: None,
+                width: None,
+                height: None,
+            },
+            MomentMedia {
+                media_type: "video".to_owned(),
+                url: "/api/assets/moment/video-user/index.m3u8".to_owned(),
+                poster_url: Some("/api/assets/moment/video-user/poster.webp".to_owned()),
+                width: None,
+                height: None,
+            },
+            MomentMedia {
+                media_type: "image".to_owned(),
+                url: "/api/assets/moment/../avatar/private.webp".to_owned(),
+                poster_url: None,
+                width: None,
+                height: None,
+            },
+        ];
+
+        assert_eq!(
+            moment_media_paths(&media)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                PathBuf::from("src/assets/moment/moment-user.webp"),
+                PathBuf::from("src/assets/moment/video-user"),
+            ])
+        );
+    }
 
     #[test]
     fn encodes_moment_image_as_resized_webp() {
