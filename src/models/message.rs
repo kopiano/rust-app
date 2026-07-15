@@ -3,6 +3,16 @@ use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SendMessageRequest {
+    pub chat_type: String,
+    pub receiver_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
+    pub content: String,
+    pub message_type: Option<i16>,
+    pub client_message_id: Uuid,
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 #[allow(dead_code)]
 pub struct Message {
@@ -10,6 +20,7 @@ pub struct Message {
     pub conversation_id: Uuid,
     pub chat_type: String,
     pub send_id: Uuid,
+    pub client_message_id: Option<Uuid>,
     pub receiver_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
     pub content: Option<String>,
@@ -20,6 +31,13 @@ pub struct Message {
     pub deleted_at: Option<DateTime<Utc>>,
     pub file_name: Option<String>,
     pub file_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageBroadcast {
+    pub event: &'static str,
+    pub message: Message,
+    pub recipients: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

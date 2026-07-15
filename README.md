@@ -14,7 +14,7 @@
 * Configuration：dotenvy
 * Logging：tracing
 * cookie保存jwt
-
+* 实时通信：websocket
 
 ### install
 * 未创建项目目录

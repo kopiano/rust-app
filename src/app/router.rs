@@ -73,6 +73,9 @@ fn task_api(state: AppState) -> Router<AppState> {
 
 fn message_api(state: AppState) -> Router<AppState> {
     Router::new()
+        .route("/message", post(message::send))
+        .route("/message/history", get(message::history))
         .route("/message/user_info", get(message::user_info))
+        .route("/message/ws", get(message::websocket))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

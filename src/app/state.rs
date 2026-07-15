@@ -1,5 +1,8 @@
 use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
+use tokio::sync::broadcast;
+
+use crate::models::message::MessageBroadcast;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -12,4 +15,5 @@ pub struct AppState {
     pub github_client_id: String,
     pub github_client_secret: String,
     pub github_redirect_uri: String,
+    pub message_tx: broadcast::Sender<MessageBroadcast>,
 }

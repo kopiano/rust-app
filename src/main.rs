@@ -21,6 +21,7 @@ async fn main() {
     let pool = postgres::connect().await;
     sqlx::migrate!("./migrations").run(&pool).await.expect("Database migration failed");
     let redis = redis::connect().await;
+    let (message_tx, _) = tokio::sync::broadcast::channel(256);
     // state
     let state = app::AppState {
         db: pool,
@@ -34,6 +35,7 @@ async fn main() {
             .expect("GITHUB_CLIENT_SECRET not found"),
         github_redirect_uri: std::env::var("GITHUB_REDIRECT_URI")
             .unwrap_or_else(|_| "http://localhost:8100/api/auth/github/callback".to_string()),
+        message_tx,
     };
 
     // router

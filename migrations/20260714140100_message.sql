@@ -1,6 +1,6 @@
 CREATE TABLE IF NOT EXISTS "message" (
     id BIGSERIAL PRIMARY KEY,
-    conversation_id UUID NOT NULL DEFAULT uuid_generate_v4() UNIQUE,
+    conversation_id UUID NOT NULL,
     chat_type VARCHAR(16) NOT NULL,
     send_id UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
     receiver_id UUID REFERENCES "user"(id) ON DELETE CASCADE,
