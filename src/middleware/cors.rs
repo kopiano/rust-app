@@ -7,6 +7,9 @@ use tower_http::cors::CorsLayer;
 pub fn cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin([
+            "http://localhost:5173".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:5173".parse::<HeaderValue>().unwrap(),
+            "http://localhost:3000".parse::<HeaderValue>().unwrap(),
             "http://localhost:1420".parse::<HeaderValue>().unwrap(),
             "https://www.coulsonzero.shop".parse::<HeaderValue>().unwrap(),
         ])

@@ -128,14 +128,31 @@ pub async fn login(
     ))
 }
 
-fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Response {
-    let cookie = Cookie::build(("access_token", token))
+fn is_local_environment() -> bool {
+    std::env::var("FRONTEND_URL")
+        .map(|url| url.starts_with("http://localhost") || url.starts_with("http://127.0.0.1"))
+        .unwrap_or(cfg!(debug_assertions))
+}
+
+fn build_auth_cookie(value: String, max_age: time::Duration) -> Cookie<'static> {
+    let cookie = Cookie::build(("access_token", value))
         .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Lax)
         .path("/")
-        .max_age(time::Duration::days(7))
-        .build();
+        .max_age(max_age);
+    let cookie = if is_local_environment() {
+        cookie.secure(false).same_site(SameSite::Lax).build()
+    } else {
+        cookie
+            .secure(true)
+            .domain(".coulsonzero.shop")
+            .same_site(SameSite::None)
+            .build()
+    };
+    cookie
+}
+
+fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Response {
+    let cookie = build_auth_cookie(token, time::Duration::days(7));
     let jar = CookieJar::new().add(cookie);
 
     (
@@ -194,13 +211,7 @@ pub async fn github_callback(
     let frontend_url = state.frontend_url.trim_end_matches('/').to_owned();
     match github_callback_inner(state, query).await {
         Ok((redirect, token)) => {
-            let cookie = Cookie::build(("access_token", token))
-                .http_only(true)
-                .secure(true)
-                .same_site(SameSite::Lax)
-                .path("/")
-                .max_age(time::Duration::days(7))
-                .build();
+            let cookie = build_auth_cookie(token, time::Duration::days(7));
             (CookieJar::new().add(cookie), redirect).into_response()
         }
         Err(status) => {
@@ -363,13 +374,7 @@ pub async fn logout(
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         }
     }
-    let cookie = Cookie::build(("access_token", ""))
-        .http_only(true)
-        .secure(true)
-        .same_site(SameSite::Lax)
-        .path("/")
-        .max_age(time::Duration::ZERO)
-        .build();
+    let cookie = build_auth_cookie(String::new(), time::Duration::ZERO);
     Ok((
         StatusCode::OK,
         CookieJar::new().add(cookie),
