@@ -1,7 +1,10 @@
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{
+        HeaderMap, HeaderValue, StatusCode,
+        header::{HOST, ORIGIN, REFERER, SET_COOKIE},
+    },
     response::{IntoResponse, Redirect, Response},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -15,11 +18,11 @@ use crate::middleware::jwt;
 use crate::models::user::{AuthResponse, LoginInput, RegisterInput, User};
 
 // Used for unknown users so the response path still performs bcrypt verification.
-const DUMMY_PASSWORD_HASH: &str =
-    "$2y$08$mnpm4SdYbuv8jY6GBq5DxOeLZWTbhoyhFStR7UclYBrbt0pCQ6SYC";
+const DUMMY_PASSWORD_HASH: &str = "$2y$08$mnpm4SdYbuv8jY6GBq5DxOeLZWTbhoyhFStR7UclYBrbt0pCQ6SYC";
 const BCRYPT_COST: u32 = 8;
 
 pub async fn register(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(input): Json<RegisterInput>,
 ) -> Result<Response, StatusCode> {
@@ -61,13 +64,18 @@ pub async fn register(
     })?;
     let token = jwt::sign(&user.id.to_string(), &state.jwt_secret, state.jwt_max_age)?;
     Ok(auth_response(
+        &headers,
         StatusCode::CREATED,
-        AuthResponse { token: token.clone(), user },
+        AuthResponse {
+            token: token.clone(),
+            user,
+        },
         token,
     ))
 }
 
 pub async fn login(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Json(input): Json<LoginInput>,
 ) -> Result<Response, StatusCode> {
@@ -76,7 +84,10 @@ pub async fn login(
     if username.is_empty() || input.password.is_empty() {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<()>::error(400, "Invalid username or password")),
+            Json(ApiResponse::<()>::error(
+                400,
+                "Invalid username or password",
+            )),
         )
             .into_response());
     }
@@ -112,18 +123,20 @@ pub async fn login(
     };
     let pool = state.db.clone();
     tokio::spawn(async move {
-        let _ = sqlx::query(
-            r##"UPDATE "user" SET last_login_at = NOW() WHERE id = $1"##,
-        )
-        .bind(user.id)
-        .execute(&pool)
-        .await;
+        let _ = sqlx::query(r##"UPDATE "user" SET last_login_at = NOW() WHERE id = $1"##)
+            .bind(user.id)
+            .execute(&pool)
+            .await;
     });
     // token
     let token = jwt::sign(&user.id.to_string(), &state.jwt_secret, state.jwt_max_age)?;
     Ok(auth_response(
+        &headers,
         StatusCode::OK,
-        AuthResponse { token: token.clone(), user },
+        AuthResponse {
+            token: token.clone(),
+            user,
+        },
         token,
     ))
 }
@@ -134,12 +147,24 @@ fn is_local_environment() -> bool {
         .unwrap_or(cfg!(debug_assertions))
 }
 
-fn build_auth_cookie(value: String, max_age: time::Duration) -> Cookie<'static> {
+fn request_uses_local_cookie(headers: &HeaderMap) -> bool {
+    headers
+        .get(ORIGIN)
+        .or_else(|| headers.get(REFERER))
+        .or_else(|| headers.get(HOST))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value.contains("localhost") || value.contains("127.0.0.1") || value.contains("[::1]")
+        })
+        .unwrap_or_else(is_local_environment)
+}
+
+fn build_auth_cookie(value: String, max_age: time::Duration, local: bool) -> Cookie<'static> {
     let cookie = Cookie::build(("access_token", value))
         .http_only(true)
         .path("/")
         .max_age(max_age);
-    let cookie = if is_local_environment() {
+    let cookie = if local {
         cookie.secure(false).same_site(SameSite::Lax).build()
     } else {
         cookie
@@ -151,16 +176,20 @@ fn build_auth_cookie(value: String, max_age: time::Duration) -> Cookie<'static> 
     cookie
 }
 
-fn auth_response(status: StatusCode, body: AuthResponse, token: String) -> Response {
-    let cookie = build_auth_cookie(token, time::Duration::days(7));
+fn auth_response(
+    headers: &HeaderMap,
+    status: StatusCode,
+    body: AuthResponse,
+    token: String,
+) -> Response {
+    let cookie = build_auth_cookie(
+        token,
+        time::Duration::days(7),
+        request_uses_local_cookie(headers),
+    );
     let jar = CookieJar::new().add(cookie);
 
-    (
-        status,
-        jar,
-        Json(ApiResponse::success(body)),
-    )
-        .into_response()
+    (status, jar, Json(ApiResponse::success(body))).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,20 +234,24 @@ pub async fn github_login(State(state): State<AppState>) -> Result<Redirect, Sta
 }
 
 pub async fn github_callback(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Query(query): Query<GithubCallback>,
 ) -> Response {
     let frontend_url = state.frontend_url.trim_end_matches('/').to_owned();
     match github_callback_inner(state, query).await {
         Ok((redirect, token)) => {
-            let cookie = build_auth_cookie(token, time::Duration::days(7));
+            let cookie = build_auth_cookie(
+                token,
+                time::Duration::days(7),
+                request_uses_local_cookie(&headers),
+            );
             (CookieJar::new().add(cookie), redirect).into_response()
         }
         Err(status) => {
             tracing::error!(%status, "GitHub OAuth callback failed");
-            Redirect::temporary(&format!(
-                "{frontend_url}/?auth_error=github_login_failed"
-            )).into_response()
+            Redirect::temporary(&format!("{frontend_url}/?auth_error=github_login_failed"))
+                .into_response()
         }
     }
 }
@@ -229,13 +262,10 @@ async fn github_callback_inner(
 ) -> Result<(Redirect, String), StatusCode> {
     let mut redis = state.redis.clone();
     let key = format!("github_oauth:{}", query.state);
-    let valid: Option<String> = redis
-        .get_del(&key)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "GitHub OAuth state lookup failed");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let valid: Option<String> = redis.get_del(&key).await.map_err(|error| {
+        tracing::error!(%error, "GitHub OAuth state lookup failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     if valid.is_none() {
         tracing::warn!("GitHub OAuth state is missing or expired");
         return Err(StatusCode::BAD_REQUEST);
@@ -362,13 +392,17 @@ pub async fn logout(
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
-    let cookie = build_auth_cookie(String::new(), time::Duration::ZERO);
-    Ok((
-        StatusCode::OK,
-        CookieJar::new().add(cookie),
-        Json(ApiResponse::success(())),
-        )
-        .into_response())
+    // Clear both cookie scopes. Older deployments may have created a host-only
+    // cookie while current production uses the shared parent domain.
+    let local_cookie = build_auth_cookie(String::new(), time::Duration::ZERO, true);
+    let domain_cookie = build_auth_cookie(String::new(), time::Duration::ZERO, false);
+    let mut response = (StatusCode::OK, Json(ApiResponse::success(()))).into_response();
+    for cookie in [local_cookie, domain_cookie] {
+        let value = HeaderValue::from_str(&cookie.to_string())
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        response.headers_mut().append(SET_COOKIE, value);
+    }
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,5 +421,7 @@ pub async fn refresh(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let user_id = user_id.ok_or(StatusCode::UNAUTHORIZED)?;
     let token = jwt::sign(&user_id, &state.jwt_secret, state.jwt_max_age)?;
-    Ok(Json(ApiResponse::success(serde_json::json!({ "token": token }))))
+    Ok(Json(ApiResponse::success(
+        serde_json::json!({ "token": token }),
+    )))
 }
