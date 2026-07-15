@@ -13,12 +13,5 @@ CREATE TABLE IF NOT EXISTS group_member (
     PRIMARY KEY (group_id, user_id)
 );
 
-ALTER TABLE "message"
-    ADD COLUMN IF NOT EXISTS group_id UUID REFERENCES "group"(id) ON DELETE CASCADE;
-
 CREATE INDEX IF NOT EXISTS group_member_user_id_idx
     ON group_member (user_id, group_id);
-
-CREATE INDEX IF NOT EXISTS message_group_latest_idx
-    ON "message" (group_id, created_at DESC, id DESC)
-    WHERE group_id IS NOT NULL AND deleted_at IS NULL;

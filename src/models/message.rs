@@ -7,10 +7,11 @@ use uuid::Uuid;
 #[allow(dead_code)]
 pub struct Message {
     pub id: i64,
-    pub message_id: Uuid,
+    pub conversation_id: Uuid,
     pub chat_type: String,
     pub send_id: Uuid,
     pub receiver_id: Option<Uuid>,
+    pub group_id: Option<Uuid>,
     pub content: Option<String>,
     pub message_type: i16,
     pub status: String,
