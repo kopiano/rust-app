@@ -193,3 +193,42 @@ Authorization: Bearer <token>
     ]
   }
 ```
+
+## user
+### profile 用户信息修改
+PUT /api/user/profile
+Authorization: Bearer <access_token>
+Content-Type: application/json
+请求参数：
+```
+  {
+    "username": "new_username",
+    "avatar": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...",
+    "password": "NewPassword123"
+  }
+```
+字段说明：
+- username：新用户名，必填
+- avatar：Base64 图片，必填，服务端会转换为 WebP
+- password：新密码；传空字符串表示不修改密码
+  成功返回：
+```json
+  {
+    "code": 200,
+    "message": "success",
+    "data": {
+      "id": "2c7f0f4d-9a1c-4e8b-a9d0-1f3b4e5c6a77",
+      "name": "new_username",
+      "email": "user@example.com",
+      "github_id": null,
+      "avatar": "/api/assets/avatar/new-username-1752585600000.webp",
+      "last_login_at": "2026-07-15T10:20:30Z",
+      "status": true,
+      "created_at": "2026-07-01T08:00:00Z",
+      "updated_at": "2026-07-15T10:25:00Z"
+    }
+  }
+
+  
+```
+注意：密码不会出现在返回结果中。GitHub 用户当前不允许通过此接口修改资料，会返回 403。

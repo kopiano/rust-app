@@ -3,7 +3,14 @@ use crate::handles::{auth, message, task, user};
 use crate::middleware::{cors, jwt, logger};
 use axum::{
     Router, middleware,
-    routing::{get, post},
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, header::CACHE_CONTROL},
+    routing::{get, post, put},
+};
+use tower::ServiceBuilder;
+use tower_http::{
+    services::ServeDir,
+    set_header::SetResponseHeaderLayer,
 };
 
 pub fn create_router(state: AppState) -> Router {
@@ -15,6 +22,15 @@ pub fn create_router(state: AppState) -> Router {
 
     Router::new()
         .route("/", get(root))
+        .nest_service(
+            "/api/assets/avatar",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ))
+                .service(ServeDir::new("src/assets/avatar")),
+        )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
         .layer(cors::cors())
@@ -41,6 +57,10 @@ fn user_api(state: AppState) -> Router<AppState> {
         .route("/users", get(user::list).post(user::create))
         .route("/users/{id}", get(user::get_by_id).put(user::update).delete(user::delete))
         .route("/users/me", get(user::me))
+        .route(
+            "/user/profile",
+            put(user::profile).layer(DefaultBodyLimit::max(7 * 1024 * 1024)),
+        )
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
 

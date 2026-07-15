@@ -17,9 +17,12 @@ bcrypt = "0.16"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-tower-http = { version = "0.7.0", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors", "fs", "set-header"] }
+tower = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 urlencoding = "2"
 chrono = { version = "0.4", features = ["serde"] }
 time = "0.3"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
