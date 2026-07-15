@@ -41,6 +41,15 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .service(ServeDir::new("src/assets/image")),
         )
+        .nest_service(
+            "/api/assets/moment",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ))
+                .service(ServeDir::new("src/assets/moment")),
+        )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
         .layer(cors::cors())
@@ -90,6 +99,11 @@ fn message_api(state: AppState) -> Router<AppState> {
 
 fn moment_api(state: AppState) -> Router<AppState> {
     Router::new()
-        .route("/moment", post(moment::create).get(moment::list))
+        .route(
+            "/moment",
+            post(moment::create)
+                .get(moment::list)
+                .layer(DefaultBodyLimit::max(305 * 1024 * 1024)),
+        )
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

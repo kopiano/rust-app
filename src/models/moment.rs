@@ -7,6 +7,8 @@ use uuid::Uuid;
 pub struct Moment {
     pub id: Uuid,
     pub user_id: Uuid,
+    pub username: String,
+    pub avatar: Option<String>,
     pub content: Option<String>,
     pub media: Json<Vec<MomentMedia>>,
     pub created_at: DateTime<Utc>,
@@ -20,6 +22,7 @@ pub struct MomentMedia {
     pub url: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct CreateMoment {
     pub content: Option<String>,
