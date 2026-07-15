@@ -7,9 +7,10 @@ use std::{
 
 use axum::{
     Extension, Json,
-    extract::{Multipart, State, multipart::Field},
+    extract::{Multipart, Query, State, multipart::Field},
     http::StatusCode,
 };
+use chrono::{DateTime, Utc};
 use image::ImageFormat;
 use serde::Deserialize;
 use tokio::{
@@ -42,6 +43,12 @@ struct SavedMomentMedia {
     media: MomentMedia,
     saved_path: PathBuf,
     pending_video: Option<PendingVideo>,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct MomentListQuery {
+    before_created_at: Option<DateTime<Utc>>,
+    before_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -211,7 +218,12 @@ pub async fn create(
 pub async fn list(
     State(state): State<AppState>,
     Extension(_claims): Extension<Claims>,
+    Query(query): Query<MomentListQuery>,
 ) -> Result<Json<ApiResponse<Vec<Moment>>>, StatusCode> {
+    if query.before_created_at.is_some() != query.before_id.is_some() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let moments = sqlx::query_as::<_, Moment>(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
@@ -221,9 +233,16 @@ pub async fn list(
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
+        WHERE (
+            $1::timestamptz IS NULL
+            OR (moment.created_at, moment.id) < ($1, $2::uuid)
+        )
         ORDER BY moment.created_at DESC, moment.id DESC
+        LIMIT 10
         "#,
     )
+    .bind(query.before_created_at)
+    .bind(query.before_id)
     .fetch_all(&state.db)
     .await
     .map_err(|error| {
