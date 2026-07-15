@@ -232,3 +232,24 @@ Content-Type: application/json
   
 ```
 注意：密码不会出现在返回结果中。GitHub 用户当前不允许通过此接口修改资料，会返回 403。
+
+### moment
+
+POST /moment
+```json
+{
+    "content":"Hello",
+    "media":[
+        {
+            "type":"image",
+            "url":"..."
+        }
+    ]
+}
+```
+GET /moment
+
+POST /moment/:id/like        点赞
+DELETE /moment/:id/unlike    取消点赞
+POST /moment/:id/comment     评论
+GET /moment/:id/comment      获取评论
