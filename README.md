@@ -130,6 +130,11 @@ src/
 └── target
 ```
 
+### git add .撤回
+```sh
+git restore --staged .
+```
+
 ## 接口性能优化
 ### login
 * bcrypt校验耗时严重，降低cost。

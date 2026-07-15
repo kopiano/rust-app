@@ -99,11 +99,7 @@ fn message_api(state: AppState) -> Router<AppState> {
 
 fn moment_api(state: AppState) -> Router<AppState> {
     Router::new()
-        .route(
-            "/moment",
-            post(moment::create)
-                .get(moment::list)
-                .layer(DefaultBodyLimit::max(305 * 1024 * 1024)),
-        )
+        .route("/moment", post(moment::create).get(moment::list).layer(DefaultBodyLimit::max(305 * 1024 * 1024)))
+        .route("/moment/{id}", get(moment::get))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

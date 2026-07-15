@@ -9,7 +9,8 @@ use axum::{
     http::StatusCode,
 };
 use image::ImageFormat;
-use tokio::io::AsyncWriteExt;
+use serde::Deserialize;
+use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -22,6 +23,44 @@ use crate::{
 const MAX_CONTENT_CHARS: usize = 5_000;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 300 * 1024 * 1024;
+const HLS_SEGMENT_SECONDS: &str = "6";
+static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
+
+struct PendingVideo {
+    source_path: PathBuf,
+    output_directory: PathBuf,
+}
+
+struct SavedMomentMedia {
+    media: MomentMedia,
+    saved_path: PathBuf,
+    pending_video: Option<PendingVideo>,
+}
+
+#[derive(Deserialize)]
+struct VideoProbeOutput {
+    streams: Vec<VideoProbeStream>,
+}
+
+#[derive(Deserialize)]
+struct VideoProbeStream {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    tags: VideoProbeTags,
+    #[serde(default)]
+    side_data_list: Vec<VideoProbeSideData>,
+}
+
+#[derive(Default, Deserialize)]
+struct VideoProbeTags {
+    rotate: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VideoProbeSideData {
+    rotation: Option<i32>,
+}
 
 pub async fn create(
     State(state): State<AppState>,
@@ -48,6 +87,7 @@ pub async fn create(
     let mut requested_media_type = None;
     let mut media = None;
     let mut saved_path = None;
+    let mut pending_video = None;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -60,7 +100,7 @@ pub async fn create(
                 let value = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
                 let value = value.trim().to_owned();
                 if value.chars().count() > MAX_CONTENT_CHARS {
-                    cleanup_saved_file(saved_path.as_deref()).await;
+                    cleanup_saved_path(saved_path.as_deref()).await;
                     return Err(StatusCode::PAYLOAD_TOO_LARGE);
                 }
                 content = Some(value);
@@ -71,18 +111,19 @@ pub async fn create(
             }
             Some("media") => {
                 if media.is_some() {
-                    cleanup_saved_file(saved_path.as_deref()).await;
+                    cleanup_saved_path(saved_path.as_deref()).await;
                     return Err(StatusCode::BAD_REQUEST);
                 }
                 let result =
                     save_moment_media(&mut field, requested_media_type.as_deref(), &username).await;
                 match result {
-                    Ok((item, path)) => {
-                        media = Some(item);
-                        saved_path = Some(path);
+                    Ok(saved) => {
+                        media = Some(saved.media);
+                        saved_path = Some(saved.saved_path);
+                        pending_video = saved.pending_video;
                     }
                     Err(status) => {
-                        cleanup_saved_file(saved_path.as_deref()).await;
+                        cleanup_saved_path(saved_path.as_deref()).await;
                         return Err(status);
                     }
                 }
@@ -99,15 +140,22 @@ pub async fn create(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let processing_status = if pending_video.is_some() {
+        "processing"
+    } else {
+        "ready"
+    };
     let result = sqlx::query_as::<_, Moment>(
         r#"
         WITH inserted AS (
-            INSERT INTO moment (user_id, content, media)
-            VALUES ($1, $2, $3)
-            RETURNING id, user_id, content, media, created_at, updated_at
+            INSERT INTO moment (user_id, content, media, processing_status)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id, user_id, content, media, processing_status,
+                      processing_error, created_at, updated_at
         )
-        SELECT inserted.id, inserted.user_id, $4::text AS username,
-               $5::text AS avatar, inserted.content, inserted.media,
+        SELECT inserted.id, inserted.user_id, $5::text AS username,
+               $6::text AS avatar, inserted.content, inserted.media,
+               inserted.processing_status, inserted.processing_error,
                inserted.created_at, inserted.updated_at
         FROM inserted
         "#,
@@ -115,6 +163,7 @@ pub async fn create(
     .bind(user_id)
     .bind(content)
     .bind(sqlx::types::Json(media.into_iter().collect::<Vec<_>>()))
+    .bind(processing_status)
     .bind(username)
     .bind(avatar)
     .fetch_one(&state.db)
@@ -122,13 +171,20 @@ pub async fn create(
     let moment = match result {
         Ok(moment) => moment,
         Err(error) => {
-            cleanup_saved_file(saved_path.as_deref()).await;
+            cleanup_saved_path(saved_path.as_deref()).await;
             tracing::error!(%error, %user_id, "Failed to create moment");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(moment))))
+    let response_status = if let Some(pending) = pending_video {
+        spawn_video_processing(state.db.clone(), moment.id, pending);
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::CREATED
+    };
+
+    Ok((response_status, Json(ApiResponse::success(moment))))
 }
 
 pub async fn list(
@@ -139,6 +195,7 @@ pub async fn list(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
                "user".avatar, moment.content, moment.media,
+               moment.processing_status, moment.processing_error,
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
@@ -155,11 +212,39 @@ pub async fn list(
     Ok(Json(ApiResponse::success(moments)))
 }
 
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(_claims): Extension<Claims>,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ApiResponse<Moment>>, StatusCode> {
+    let moment = sqlx::query_as::<_, Moment>(
+        r#"
+        SELECT moment.id, moment.user_id, "user".name AS username,
+               "user".avatar, moment.content, moment.media,
+               moment.processing_status, moment.processing_error,
+               moment.created_at, moment.updated_at
+        FROM moment
+        INNER JOIN "user" ON "user".id = moment.user_id
+        WHERE moment.id = $1
+        "#,
+    )
+    .bind(moment_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %moment_id, "Failed to load moment");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ApiResponse::success(moment)))
+}
+
 async fn save_moment_media(
     field: &mut Field<'_>,
     requested_media_type: Option<&str>,
     username: &str,
-) -> Result<(MomentMedia, PathBuf), StatusCode> {
+) -> Result<SavedMomentMedia, StatusCode> {
     let content_type = field.content_type().map(str::to_owned);
     let original_name = field.file_name().map(str::to_owned);
     let media_type = requested_media_type
@@ -173,7 +258,7 @@ async fn save_moment_media(
     let timestamp = chrono::Utc::now().timestamp_millis();
     let unique = Uuid::new_v4().simple().to_string();
     let safe_username = media_name_component(username);
-    let filename = match media_type {
+    match media_type {
         "image" => {
             if !content_type
                 .as_deref()
@@ -190,32 +275,289 @@ async fn save_moment_media(
             tokio::fs::write(directory.join(&filename), encoded)
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-            filename
+            let path = directory.join(&filename);
+            Ok(SavedMomentMedia {
+                media: MomentMedia {
+                    media_type: media_type.to_owned(),
+                    url: format!("/api/assets/moment/{filename}"),
+                    poster_url: None,
+                    width: None,
+                    height: None,
+                },
+                saved_path: path,
+                pending_video: None,
+            })
         }
         "video" => {
             let extension = video_extension(content_type.as_deref(), original_name.as_deref())
                 .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
-            let filename = format!("moment-{safe_username}-{timestamp}-{unique}.{extension}");
-            let final_path = directory.join(&filename);
-            let temporary_path = directory.join(format!(".{filename}.uploading"));
-            stream_video_to_file(field, &temporary_path).await?;
-            if let Err(error) = tokio::fs::rename(&temporary_path, &final_path).await {
+            let video_directory_name = format!("video-{safe_username}-{timestamp}-{unique}");
+            let video_directory = directory.join(&video_directory_name);
+            tokio::fs::create_dir(&video_directory)
+                .await
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            let source_path = video_directory.join(format!("source.{extension}"));
+            let temporary_path = video_directory.join(format!(".source.{extension}.uploading"));
+            if let Err(status) = stream_video_to_file(field, &temporary_path).await {
+                cleanup_saved_path(Some(&video_directory)).await;
+                return Err(status);
+            }
+            if let Err(error) = tokio::fs::rename(&temporary_path, &source_path).await {
                 cleanup_saved_file(Some(&temporary_path)).await;
                 tracing::error!(%error, "Failed to finalize moment video");
+                cleanup_saved_path(Some(&video_directory)).await;
                 return Err(StatusCode::INTERNAL_SERVER_ERROR);
             }
-            filename
+            let (width, height) = match probe_video_dimensions(&source_path).await {
+                Ok(dimensions) => dimensions,
+                Err(status) => {
+                    cleanup_saved_path(Some(&video_directory)).await;
+                    return Err(status);
+                }
+            };
+
+            Ok(SavedMomentMedia {
+                media: MomentMedia {
+                    media_type: media_type.to_owned(),
+                    url: format!("/api/assets/moment/{video_directory_name}/index.m3u8"),
+                    poster_url: Some(format!(
+                        "/api/assets/moment/{video_directory_name}/poster.webp"
+                    )),
+                    width: Some(width),
+                    height: Some(height),
+                },
+                saved_path: video_directory.clone(),
+                pending_video: Some(PendingVideo {
+                    source_path,
+                    output_directory: video_directory,
+                }),
+            })
         }
         _ => return Err(StatusCode::BAD_REQUEST),
-    };
-    let path = directory.join(&filename);
-    Ok((
-        MomentMedia {
-            media_type: media_type.to_owned(),
-            url: format!("/api/assets/moment/{filename}"),
-        },
-        path,
-    ))
+    }
+}
+
+async fn probe_video_dimensions(source_path: &Path) -> Result<(u32, u32), StatusCode> {
+    let ffprobe = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_owned());
+    let output = Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height:stream_tags=rotate:stream_side_data=rotation",
+            "-of",
+            "json",
+        ])
+        .arg(source_path)
+        .output()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, executable = %ffprobe, "Failed to start FFprobe");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            status = ?output.status.code(),
+            error = %stderr.trim(),
+            "FFprobe video inspection failed"
+        );
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    parse_video_dimensions(&output.stdout).ok_or_else(|| {
+        tracing::error!("FFprobe did not return valid video dimensions");
+        StatusCode::UNPROCESSABLE_ENTITY
+    })
+}
+
+fn parse_video_dimensions(output: &[u8]) -> Option<(u32, u32)> {
+    let probe = serde_json::from_slice::<VideoProbeOutput>(output).ok()?;
+    let stream = probe.streams.first()?;
+    if stream.width == 0 || stream.height == 0 {
+        return None;
+    }
+
+    let rotation = stream
+        .tags
+        .rotate
+        .as_deref()
+        .and_then(|value| value.parse::<i32>().ok())
+        .or_else(|| stream.side_data_list.iter().find_map(|item| item.rotation))
+        .unwrap_or(0)
+        .rem_euclid(360);
+
+    if matches!(rotation, 90 | 270) {
+        Some((stream.height, stream.width))
+    } else {
+        Some((stream.width, stream.height))
+    }
+}
+
+fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVideo) {
+    tokio::spawn(async move {
+        let result = transcode_video_to_hls(&pending.source_path, &pending.output_directory).await;
+        let (status, processing_error) = match result {
+            Ok(()) => ("ready", None),
+            Err(error_status) => {
+                tracing::error!(
+                    %moment_id,
+                    status = %error_status,
+                    "Moment video processing failed"
+                );
+                ("failed", Some(error_status.to_string()))
+            }
+        };
+
+        if let Err(error) = sqlx::query(
+            r#"
+            UPDATE moment
+            SET processing_status = $2, processing_error = $3, updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(moment_id)
+        .bind(status)
+        .bind(processing_error)
+        .execute(&db)
+        .await
+        {
+            tracing::error!(%error, %moment_id, "Failed to update moment processing status");
+        }
+    });
+}
+
+async fn transcode_video_to_hls(
+    source_path: &Path,
+    output_directory: &Path,
+) -> Result<(), StatusCode> {
+    let _permit = VIDEO_TRANSCODE_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
+    let playlist_path = output_directory.join("index.m3u8");
+    let segment_pattern = output_directory.join("segment-%05d.ts");
+
+    let output = Command::new(&ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+        .arg(source_path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "24",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-force_key_frames",
+            "expr:gte(t,n_forced*6)",
+            "-f",
+            "hls",
+            "-hls_time",
+            HLS_SEGMENT_SECONDS,
+            "-hls_playlist_type",
+            "vod",
+            "-hls_segment_type",
+            "mpegts",
+            "-hls_flags",
+            "independent_segments",
+            "-hls_segment_filename",
+        ])
+        .arg(segment_pattern)
+        .arg(playlist_path)
+        .output()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            status = ?output.status.code(),
+            error = %stderr.trim(),
+            "FFmpeg HLS transcoding failed"
+        );
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    generate_video_poster(&ffmpeg, source_path, output_directory).await?;
+
+    Ok(())
+}
+
+async fn generate_video_poster(
+    ffmpeg: &str,
+    source_path: &Path,
+    output_directory: &Path,
+) -> Result<(), StatusCode> {
+    let output = Command::new(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
+        .arg(source_path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            "thumbnail=150",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "mjpeg",
+            "-q:v",
+            "3",
+            "-f",
+            "image2pipe",
+            "pipe:1",
+        ])
+        .output()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg poster generation");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::error!(
+            status = ?output.status.code(),
+            error = %stderr.trim(),
+            "FFmpeg poster generation failed"
+        );
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let encoded = tokio::task::spawn_blocking(move || encode_video_poster(&output.stdout))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to encode video poster as WebP");
+            StatusCode::UNPROCESSABLE_ENTITY
+        })?;
+    tokio::fs::write(output_directory.join("poster.webp"), encoded)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to save video poster");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 async fn read_field_limited(
@@ -278,6 +620,21 @@ async fn cleanup_saved_file(path: Option<&Path>) {
     }
 }
 
+async fn cleanup_saved_path(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    let result = match tokio::fs::metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => tokio::fs::remove_dir_all(path).await,
+        Ok(_) => tokio::fs::remove_file(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, path = %path.display(), "Failed to clean up moment upload");
+    }
+}
+
 fn infer_media_type(content_type: Option<&str>) -> Option<&'static str> {
     match content_type {
         Some(value) if value.starts_with("image/") => Some("image"),
@@ -315,6 +672,14 @@ fn encode_moment_image(bytes: &[u8]) -> image::ImageResult<Vec<u8>> {
     Ok(encoded.into_inner())
 }
 
+fn encode_video_poster(bytes: &[u8]) -> image::ImageResult<Vec<u8>> {
+    let image = image::load_from_memory(bytes)?;
+    let resized = image.thumbnail(1280, 1280);
+    let mut encoded = Cursor::new(Vec::new());
+    resized.write_to(&mut encoded, ImageFormat::WebP)?;
+    Ok(encoded.into_inner())
+}
+
 fn video_extension(
     content_type: Option<&str>,
     original_name: Option<&str>,
@@ -343,7 +708,10 @@ fn video_extension(
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_moment_image, media_name_component, video_extension};
+    use super::{
+        encode_moment_image, encode_video_poster, media_name_component, parse_video_dimensions,
+        video_extension,
+    };
     use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
     use std::io::Cursor;
 
@@ -358,6 +726,20 @@ mod tests {
         assert_eq!(
             image::load_from_memory(&encoded).unwrap().dimensions(),
             (1920, 960)
+        );
+    }
+
+    #[test]
+    fn encodes_video_poster_as_resized_webp() {
+        let source = DynamicImage::ImageRgb8(RgbImage::new(1920, 1080));
+        let mut input = Cursor::new(Vec::new());
+        source.write_to(&mut input, ImageFormat::Jpeg).unwrap();
+
+        let encoded = encode_video_poster(&input.into_inner()).unwrap();
+        assert_eq!(image::guess_format(&encoded).unwrap(), ImageFormat::WebP);
+        assert_eq!(
+            image::load_from_memory(&encoded).unwrap().dimensions(),
+            (1280, 720)
         );
     }
 
@@ -379,5 +761,15 @@ mod tests {
     fn sanitizes_username_for_moment_filename() {
         assert_eq!(media_name_component("Admin User!"), "adminuser");
         assert_eq!(media_name_component("动态用户"), "user");
+    }
+
+    #[test]
+    fn reads_display_dimensions_from_ffprobe_output() {
+        let landscape = br#"{"streams":[{"width":1920,"height":1080}]}"#;
+        let portrait =
+            br#"{"streams":[{"width":1920,"height":1080,"side_data_list":[{"rotation":-90}]}]}"#;
+
+        assert_eq!(parse_video_dimensions(landscape), Some((1920, 1080)));
+        assert_eq!(parse_video_dimensions(portrait), Some((1080, 1920)));
     }
 }
