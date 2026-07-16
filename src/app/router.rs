@@ -1,5 +1,5 @@
 use crate::app::AppState;
-use crate::handles::{auth, message, moment, task, user};
+use crate::handles::{auth, message, moment, music, task, user};
 use crate::middleware::{cors, jwt, logger};
 use axum::{
     Router,
@@ -12,6 +12,7 @@ use tower::ServiceBuilder;
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
 const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
+const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
@@ -19,6 +20,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(user_api(state.clone()))
         .merge(message_api(state.clone()))
         .merge(moment_api(state.clone()))
+        .merge(music_api(state.clone()))
         .merge(task_api(state.clone()));
 
     Router::new()
@@ -49,6 +51,15 @@ pub fn create_router(state: AppState) -> Router {
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
                 .service(ServeDir::new("src/assets/moment")),
+        )
+        .nest_service(
+            "/api/assets/music",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ))
+                .service(ServeDir::new("src/assets/music")),
         )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
@@ -111,4 +122,11 @@ fn moment_api(state: AppState) -> Router<AppState> {
         .route("/moment/{id}/comment", post(moment::comment))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new().merge(public).merge(authenticated)
+}
+
+fn music_api(state: AppState) -> Router<AppState> {
+    Router::new()
+        .route("/music", get(music::list).post(music::upload).layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES)))
+        .route("/music/{id}/favorite", put(music::favorite))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

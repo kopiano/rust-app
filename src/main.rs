@@ -41,8 +41,11 @@ async fn main() {
     // router
     let app = app::router::create_router(state);
     // port
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:8100").await.unwrap();
-    tracing::info!("Server is running on http://localhost:8100");
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8100".to_owned());
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .unwrap();
+    tracing::info!("Server is running on http://localhost:{port}");
     // run axum web server
     axum::serve(listener, app).await.unwrap();
 }
