@@ -14,8 +14,36 @@ pub struct Moment {
     pub processing_status: String,
     pub processing_progress: i16,
     pub processing_error: Option<String>,
+    pub like_count: i64,
+    pub comment_count: i64,
+    pub liked: bool,
+    pub comments: Json<Vec<MomentComment>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct MomentComment {
+    pub id: Uuid,
+    pub moment_id: Uuid,
+    pub user_id: Uuid,
+    pub username: String,
+    pub avatar: Option<String>,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct MomentLikeState {
+    pub moment_id: Uuid,
+    pub liked: bool,
+    pub like_count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateMomentComment {
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,10 +24,11 @@ use crate::{
     app::AppState,
     common::response::ApiResponse,
     middleware::jwt::Claims,
-    models::moment::{Moment, MomentMedia},
+    models::moment::{CreateMomentComment, Moment, MomentComment, MomentLikeState, MomentMedia},
 };
 
 const MAX_CONTENT_CHARS: usize = 5_000;
+const MAX_COMMENT_CHARS: usize = 1_000;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const HLS_SEGMENT_SECONDS: &str = "6";
@@ -178,7 +179,9 @@ pub async fn create(
         SELECT inserted.id, inserted.user_id, $6::text AS username,
                $7::text AS avatar, inserted.content, inserted.media,
                inserted.processing_status, inserted.processing_progress,
-               inserted.processing_error,
+               inserted.processing_error, 0::bigint AS like_count,
+               0::bigint AS comment_count, FALSE AS liked,
+               '[]'::jsonb AS comments,
                inserted.created_at, inserted.updated_at
         FROM inserted
         "#,
@@ -217,9 +220,13 @@ pub async fn create(
 
 pub async fn list(
     State(state): State<AppState>,
-    Extension(_claims): Extension<Claims>,
+    Extension(claims): Extension<Claims>,
     Query(query): Query<MomentListQuery>,
 ) -> Result<Json<ApiResponse<Vec<Moment>>>, StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     if query.before_created_at.is_some() != query.before_id.is_some() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -230,6 +237,43 @@ pub async fn list(
                "user".avatar, moment.content, moment.media,
                moment.processing_status, moment.processing_progress,
                moment.processing_error,
+               (
+                   SELECT COUNT(*)::bigint
+                   FROM moment_like
+                   WHERE moment_like.moment_id = moment.id
+               ) AS like_count,
+               (
+                   SELECT COUNT(*)::bigint
+                   FROM moment_comment
+                   WHERE moment_comment.moment_id = moment.id
+                     AND moment_comment.deleted_at IS NULL
+               ) AS comment_count,
+               EXISTS (
+                   SELECT 1
+                   FROM moment_like
+                   WHERE moment_like.moment_id = moment.id
+                     AND moment_like.user_id = $3
+               ) AS liked,
+               COALESCE((
+                   SELECT jsonb_agg(
+                       jsonb_build_object(
+                           'id', moment_comment.id,
+                           'moment_id', moment_comment.moment_id,
+                           'user_id', moment_comment.user_id,
+                           'username', comment_user.name,
+                           'avatar', comment_user.avatar,
+                           'content', moment_comment.content,
+                           'created_at', moment_comment.created_at,
+                           'updated_at', moment_comment.updated_at
+                       )
+                       ORDER BY moment_comment.created_at ASC, moment_comment.id ASC
+                   )
+                   FROM moment_comment
+                   INNER JOIN "user" AS comment_user
+                       ON comment_user.id = moment_comment.user_id
+                   WHERE moment_comment.moment_id = moment.id
+                     AND moment_comment.deleted_at IS NULL
+               ), '[]'::jsonb) AS comments,
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
@@ -243,6 +287,7 @@ pub async fn list(
     )
     .bind(query.before_created_at)
     .bind(query.before_id)
+    .bind(user_id)
     .fetch_all(&state.db)
     .await
     .map_err(|error| {
@@ -255,15 +300,56 @@ pub async fn list(
 
 pub async fn get(
     State(state): State<AppState>,
-    Extension(_claims): Extension<Claims>,
+    Extension(claims): Extension<Claims>,
     axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<Moment>>, StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let moment = sqlx::query_as::<_, Moment>(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
                "user".avatar, moment.content, moment.media,
                moment.processing_status, moment.processing_progress,
                moment.processing_error,
+               (
+                   SELECT COUNT(*)::bigint
+                   FROM moment_like
+                   WHERE moment_like.moment_id = moment.id
+               ) AS like_count,
+               (
+                   SELECT COUNT(*)::bigint
+                   FROM moment_comment
+                   WHERE moment_comment.moment_id = moment.id
+                     AND moment_comment.deleted_at IS NULL
+               ) AS comment_count,
+               EXISTS (
+                   SELECT 1
+                   FROM moment_like
+                   WHERE moment_like.moment_id = moment.id
+                     AND moment_like.user_id = $2
+               ) AS liked,
+               COALESCE((
+                   SELECT jsonb_agg(
+                       jsonb_build_object(
+                           'id', moment_comment.id,
+                           'moment_id', moment_comment.moment_id,
+                           'user_id', moment_comment.user_id,
+                           'username', comment_user.name,
+                           'avatar', comment_user.avatar,
+                           'content', moment_comment.content,
+                           'created_at', moment_comment.created_at,
+                           'updated_at', moment_comment.updated_at
+                       )
+                       ORDER BY moment_comment.created_at ASC, moment_comment.id ASC
+                   )
+                   FROM moment_comment
+                   INNER JOIN "user" AS comment_user
+                       ON comment_user.id = moment_comment.user_id
+                   WHERE moment_comment.moment_id = moment.id
+                     AND moment_comment.deleted_at IS NULL
+               ), '[]'::jsonb) AS comments,
                moment.created_at, moment.updated_at
         FROM moment
         INNER JOIN "user" ON "user".id = moment.user_id
@@ -271,6 +357,7 @@ pub async fn get(
         "#,
     )
     .bind(moment_id)
+    .bind(user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|error| {
@@ -280,6 +367,148 @@ pub async fn get(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok(Json(ApiResponse::success(moment)))
+}
+
+pub async fn like(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ApiResponse<MomentLikeState>>, StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let result = sqlx::query_as::<_, MomentLikeState>(
+        r#"
+        WITH target AS (
+            SELECT id
+            FROM moment
+            WHERE id = $1
+        ),
+        inserted AS (
+            INSERT INTO moment_like (moment_id, user_id)
+            SELECT target.id, $2
+            FROM target
+            ON CONFLICT (moment_id, user_id) DO NOTHING
+            RETURNING moment_id
+        )
+        SELECT target.id AS moment_id, TRUE AS liked,
+               (
+                   SELECT COUNT(*)::bigint
+                   FROM moment_like
+                   WHERE moment_like.moment_id = target.id
+               ) + (
+                   SELECT COUNT(*)::bigint
+                   FROM inserted
+               ) AS like_count
+        FROM target
+        "#,
+    )
+    .bind(moment_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %moment_id, %user_id, "Failed to like moment");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+pub async fn unlike(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+) -> Result<Json<ApiResponse<MomentLikeState>>, StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let result = sqlx::query_as::<_, MomentLikeState>(
+        r#"
+        WITH target AS (
+            SELECT id
+            FROM moment
+            WHERE id = $1
+        ),
+        deleted AS (
+            DELETE FROM moment_like
+            WHERE moment_id = $1 AND user_id = $2
+            RETURNING moment_id
+        )
+        SELECT target.id AS moment_id, FALSE AS liked,
+               GREATEST(
+                   0,
+                   (
+                       SELECT COUNT(*)::bigint
+                       FROM moment_like
+                       WHERE moment_like.moment_id = target.id
+                   ) - (
+                       SELECT COUNT(*)::bigint
+                       FROM deleted
+                   )
+               ) AS like_count
+        FROM target
+        "#,
+    )
+    .bind(moment_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %moment_id, %user_id, "Failed to unlike moment");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+pub async fn comment(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+    Json(input): Json<CreateMomentComment>,
+) -> Result<(StatusCode, Json<ApiResponse<MomentComment>>), StatusCode> {
+    let user_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let content = input.content.trim();
+    if content.is_empty() || content.chars().count() > MAX_COMMENT_CHARS {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let comment = sqlx::query_as::<_, MomentComment>(
+        r#"
+        WITH inserted AS (
+            INSERT INTO moment_comment (moment_id, user_id, content)
+            SELECT moment.id, $2, $3
+            FROM moment
+            WHERE moment.id = $1
+            RETURNING id, moment_id, user_id, content, created_at, updated_at
+        )
+        SELECT inserted.id, inserted.moment_id, inserted.user_id,
+               "user".name AS username, "user".avatar,
+               inserted.content, inserted.created_at, inserted.updated_at
+        FROM inserted
+        INNER JOIN "user" ON "user".id = inserted.user_id
+        "#,
+    )
+    .bind(moment_id)
+    .bind(user_id)
+    .bind(content)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %moment_id, %user_id, "Failed to comment on moment");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(comment))))
 }
 
 pub async fn delete(
