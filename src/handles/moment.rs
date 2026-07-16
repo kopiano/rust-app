@@ -31,6 +31,8 @@ const MAX_CONTENT_CHARS: usize = 5_000;
 const MAX_COMMENT_CHARS: usize = 1_000;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MOMENT_PAGE_SIZE: i64 = 10;
+const MAX_MOMENT_PAGE_SIZE: i64 = 50;
 const HLS_SEGMENT_SECONDS: &str = "6";
 static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
@@ -50,6 +52,7 @@ struct SavedMomentMedia {
 pub(crate) struct MomentListQuery {
     before_created_at: Option<DateTime<Utc>>,
     before_id: Option<Uuid>,
+    limit: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +233,10 @@ pub async fn list(
     if query.before_created_at.is_some() != query.before_id.is_some() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_MOMENT_PAGE_SIZE)
+        .clamp(1, MAX_MOMENT_PAGE_SIZE);
 
     let moments = sqlx::query_as::<_, Moment>(
         r#"
@@ -282,12 +289,13 @@ pub async fn list(
             OR (moment.created_at, moment.id) < ($1, $2::uuid)
         )
         ORDER BY moment.created_at DESC, moment.id DESC
-        LIMIT 10
+        LIMIT $4
         "#,
     )
     .bind(query.before_created_at)
     .bind(query.before_id)
     .bind(user_id)
+    .bind(limit)
     .fetch_all(&state.db)
     .await
     .map_err(|error| {
