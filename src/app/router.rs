@@ -74,35 +74,23 @@ fn auth_api() -> Router<AppState> {
 fn user_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/users", get(user::list).post(user::create))
-        .route(
-            "/users/{id}",
-            get(user::get_by_id).put(user::update).delete(user::delete),
-        )
+        .route("/users/{id}", get(user::get_by_id).put(user::update).delete(user::delete))
         .route("/users/me", get(user::me))
-        .route(
-            "/user/profile",
-            put(user::profile).layer(DefaultBodyLimit::max(7 * 1024 * 1024)),
-        ) // change info
+        .route("/user/profile", put(user::profile).layer(DefaultBodyLimit::max(7 * 1024 * 1024))) // change info
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
 
 fn task_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/task", get(task::list).post(task::create))
-        .route(
-            "/task/{id}",
-            get(task::get_by_id).put(task::update).delete(task::delete),
-        )
+        .route("/task/{id}", get(task::get_by_id).put(task::update).delete(task::delete))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
 
 fn message_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/message", post(message::send))
-        .route(
-            "/message/image",
-            post(message::send_image).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
-        ) // send image, testing
+        .route("/message/image", post(message::send_image).layer(DefaultBodyLimit::max(12 * 1024 * 1024))) // send image, testing
         .route("/message/history", get(message::history)) // chat message history
         .route("/message/user_info", get(message::user_info)) // group and contacts
         .route("/message/ws", get(message::websocket))
@@ -110,18 +98,17 @@ fn message_api(state: AppState) -> Router<AppState> {
 }
 
 fn moment_api(state: AppState) -> Router<AppState> {
-    Router::new()
-        .route(
-            "/moment",
-            post(moment::create)
-                .get(moment::list)
-                .layer(DefaultBodyLimit::max(MAX_MOMENT_BODY_BYTES)),
-        )
-        .route("/moment/{id}", get(moment::get).delete(moment::delete))
-        .route(
-            "/moment/{id}/like",
-            post(moment::like).delete(moment::unlike),
-        )
+    let public = Router::new()
+        .route("/moment", get(moment::list))
+        .route("/moment/{id}", get(moment::get))
+        .route("/moment/{id}/view", post(moment::view))
+        .route_layer(middleware::from_fn_with_state(state.clone(), jwt::optional_auth));
+
+    let authenticated = Router::new()
+        .route("/moment", post(moment::create).layer(DefaultBodyLimit::max(MAX_MOMENT_BODY_BYTES)))
+        .route("/moment/{id}", axum::routing::delete(moment::delete))
+        .route("/moment/{id}/like", post(moment::like).delete(moment::unlike))
         .route("/moment/{id}/comment", post(moment::comment))
-        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new().merge(public).merge(authenticated)
 }

@@ -3,6 +3,9 @@ CREATE TABLE IF NOT EXISTS moment (
     user_id UUID NOT NULL REFERENCES "user"(id) ON DELETE CASCADE,
     content TEXT,
     media JSONB NOT NULL DEFAULT '[]'::jsonb,
+    like_count INT NOT NULL DEFAULT 0,
+    comment_count INT NOT NULL DEFAULT 0,
+    view_count BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

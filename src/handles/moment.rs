@@ -8,9 +8,13 @@ use std::{
 use axum::{
     Extension, Json,
     extract::{Multipart, Query, State, multipart::Field},
-    http::StatusCode,
+    http::{
+        HeaderMap, StatusCode,
+        header::{HOST, ORIGIN, REFERER},
+    },
 };
-use chrono::{DateTime, Utc};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use image::ImageFormat;
 use serde::Deserialize;
 use tokio::{
@@ -24,7 +28,9 @@ use crate::{
     app::AppState,
     common::response::ApiResponse,
     middleware::jwt::Claims,
-    models::moment::{CreateMomentComment, Moment, MomentComment, MomentLikeState, MomentMedia},
+    models::moment::{
+        CreateMomentComment, Moment, MomentComment, MomentLikeState, MomentMedia, MomentViewState,
+    },
 };
 
 const MAX_CONTENT_CHARS: usize = 5_000;
@@ -34,6 +40,8 @@ const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MOMENT_PAGE_SIZE: i64 = 10;
 const MAX_MOMENT_PAGE_SIZE: i64 = 50;
 const HLS_SEGMENT_SECONDS: &str = "6";
+const MOMENT_VIEW_UTC_OFFSET_HOURS: i64 = 8;
+const MOMENT_VISITOR_COOKIE: &str = "visitor_id";
 static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 struct PendingVideo {
@@ -183,7 +191,8 @@ pub async fn create(
                $7::text AS avatar, inserted.content, inserted.media,
                inserted.processing_status, inserted.processing_progress,
                inserted.processing_error, 0::bigint AS like_count,
-               0::bigint AS comment_count, FALSE AS liked,
+               0::bigint AS comment_count, 0::bigint AS view_count,
+               FALSE AS liked,
                '[]'::jsonb AS comments,
                inserted.created_at, inserted.updated_at
         FROM inserted
@@ -223,13 +232,10 @@ pub async fn create(
 
 pub async fn list(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    claims: Option<Extension<Claims>>,
     Query(query): Query<MomentListQuery>,
 ) -> Result<Json<ApiResponse<Vec<Moment>>>, StatusCode> {
-    let user_id = claims
-        .sub
-        .parse::<Uuid>()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let user_id = optional_user_id(claims)?;
     if query.before_created_at.is_some() != query.before_id.is_some() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -244,17 +250,9 @@ pub async fn list(
                "user".avatar, moment.content, moment.media,
                moment.processing_status, moment.processing_progress,
                moment.processing_error,
-               (
-                   SELECT COUNT(*)::bigint
-                   FROM moment_like
-                   WHERE moment_like.moment_id = moment.id
-               ) AS like_count,
-               (
-                   SELECT COUNT(*)::bigint
-                   FROM moment_comment
-                   WHERE moment_comment.moment_id = moment.id
-                     AND moment_comment.deleted_at IS NULL
-               ) AS comment_count,
+               moment.like_count::bigint AS like_count,
+               moment.comment_count::bigint AS comment_count,
+               moment.view_count::bigint AS view_count,
                EXISTS (
                    SELECT 1
                    FROM moment_like
@@ -308,30 +306,19 @@ pub async fn list(
 
 pub async fn get(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    claims: Option<Extension<Claims>>,
     axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
 ) -> Result<Json<ApiResponse<Moment>>, StatusCode> {
-    let user_id = claims
-        .sub
-        .parse::<Uuid>()
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let user_id = optional_user_id(claims)?;
     let moment = sqlx::query_as::<_, Moment>(
         r#"
         SELECT moment.id, moment.user_id, "user".name AS username,
                "user".avatar, moment.content, moment.media,
                moment.processing_status, moment.processing_progress,
                moment.processing_error,
-               (
-                   SELECT COUNT(*)::bigint
-                   FROM moment_like
-                   WHERE moment_like.moment_id = moment.id
-               ) AS like_count,
-               (
-                   SELECT COUNT(*)::bigint
-                   FROM moment_comment
-                   WHERE moment_comment.moment_id = moment.id
-                     AND moment_comment.deleted_at IS NULL
-               ) AS comment_count,
+               moment.like_count::bigint AS like_count,
+               moment.comment_count::bigint AS comment_count,
+               moment.view_count::bigint AS view_count,
                EXISTS (
                    SELECT 1
                    FROM moment_like
@@ -399,17 +386,22 @@ pub async fn like(
             FROM target
             ON CONFLICT (moment_id, user_id) DO NOTHING
             RETURNING moment_id
+        ),
+        updated AS (
+            UPDATE moment
+            SET like_count = moment.like_count + (
+                    SELECT COUNT(*)::int FROM inserted
+                ),
+                updated_at = CASE
+                    WHEN EXISTS (SELECT 1 FROM inserted) THEN NOW()
+                    ELSE moment.updated_at
+                END
+            WHERE moment.id IN (SELECT id FROM target)
+            RETURNING moment.id, moment.like_count
         )
-        SELECT target.id AS moment_id, TRUE AS liked,
-               (
-                   SELECT COUNT(*)::bigint
-                   FROM moment_like
-                   WHERE moment_like.moment_id = target.id
-               ) + (
-                   SELECT COUNT(*)::bigint
-                   FROM inserted
-               ) AS like_count
-        FROM target
+        SELECT updated.id AS moment_id, TRUE AS liked,
+               updated.like_count::bigint AS like_count
+        FROM updated
         "#,
     )
     .bind(moment_id)
@@ -445,20 +437,23 @@ pub async fn unlike(
             DELETE FROM moment_like
             WHERE moment_id = $1 AND user_id = $2
             RETURNING moment_id
+        ),
+        updated AS (
+            UPDATE moment
+            SET like_count = GREATEST(
+                    0,
+                    moment.like_count - (SELECT COUNT(*)::int FROM deleted)
+                ),
+                updated_at = CASE
+                    WHEN EXISTS (SELECT 1 FROM deleted) THEN NOW()
+                    ELSE moment.updated_at
+                END
+            WHERE moment.id IN (SELECT id FROM target)
+            RETURNING moment.id, moment.like_count
         )
-        SELECT target.id AS moment_id, FALSE AS liked,
-               GREATEST(
-                   0,
-                   (
-                       SELECT COUNT(*)::bigint
-                       FROM moment_like
-                       WHERE moment_like.moment_id = target.id
-                   ) - (
-                       SELECT COUNT(*)::bigint
-                       FROM deleted
-                   )
-               ) AS like_count
-        FROM target
+        SELECT updated.id AS moment_id, FALSE AS liked,
+               updated.like_count::bigint AS like_count
+        FROM updated
         "#,
     )
     .bind(moment_id)
@@ -497,12 +492,20 @@ pub async fn comment(
             FROM moment
             WHERE moment.id = $1
             RETURNING id, moment_id, user_id, content, created_at, updated_at
+        ),
+        updated AS (
+            UPDATE moment
+            SET comment_count = moment.comment_count + 1,
+                updated_at = NOW()
+            WHERE moment.id IN (SELECT moment_id FROM inserted)
+            RETURNING moment.id
         )
         SELECT inserted.id, inserted.moment_id, inserted.user_id,
                "user".name AS username, "user".avatar,
                inserted.content, inserted.created_at, inserted.updated_at
         FROM inserted
         INNER JOIN "user" ON "user".id = inserted.user_id
+        INNER JOIN updated ON updated.id = inserted.moment_id
         "#,
     )
     .bind(moment_id)
@@ -517,6 +520,209 @@ pub async fn comment(
     .ok_or(StatusCode::NOT_FOUND)?;
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(comment))))
+}
+
+pub async fn view(
+    State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    axum::extract::Path(moment_id): axum::extract::Path<Uuid>,
+) -> Result<(CookieJar, Json<ApiResponse<MomentViewState>>), StatusCode> {
+    let user_id = optional_user_id(claims)?;
+    let (visitor_id, jar) = if user_id.is_some() {
+        (None, jar)
+    } else if let Some(visitor_id) = jar
+        .get(MOMENT_VISITOR_COOKIE)
+        .and_then(|cookie| Uuid::parse_str(cookie.value()).ok())
+    {
+        (Some(visitor_id), jar)
+    } else {
+        let visitor_id = Uuid::new_v4();
+        let cookie = build_moment_visitor_cookie(&state, &headers, visitor_id);
+        (Some(visitor_id), jar.add(cookie))
+    };
+    let (viewer_kind, viewer_id) = match (user_id, visitor_id) {
+        (Some(user_id), None) => ("user", user_id),
+        (None, Some(visitor_id)) => ("visitor", visitor_id),
+        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    let (view_date, ttl_seconds) =
+        moment_view_date_and_ttl(Utc::now()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let dedup_key = format!("moment:view:{moment_id}:{viewer_kind}:{viewer_id}:{view_date}");
+    let mut redis = state.redis.clone();
+    let acquired = redis::cmd("SET")
+        .arg(&dedup_key)
+        .arg("1")
+        .arg("NX")
+        .arg("EX")
+        .arg(ttl_seconds)
+        .query_async::<Option<String>>(&mut redis)
+        .await
+        .map_err(|error| {
+            tracing::error!(
+                %error,
+                %moment_id,
+                %viewer_kind,
+                %viewer_id,
+                "Failed to deduplicate moment view"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .is_some();
+
+    if !acquired {
+        let view_state = load_moment_view_state(&state.db, moment_id, false)
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    %error,
+                    %moment_id,
+                    %viewer_kind,
+                    %viewer_id,
+                    "Failed to load moment counters"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        return Ok((jar, Json(ApiResponse::success(view_state))));
+    }
+
+    let result = sqlx::query_as::<_, MomentViewState>(
+        r#"
+        WITH inserted AS (
+            INSERT INTO moment_view (moment_id, user_id, visitor_id, viewed_on)
+            SELECT moment.id, $2, $3, $4
+            FROM moment
+            WHERE moment.id = $1
+            ON CONFLICT DO NOTHING
+            RETURNING moment_id
+        ),
+        updated AS (
+            UPDATE moment
+            SET view_count = moment.view_count + 1,
+                updated_at = NOW()
+            WHERE moment.id IN (SELECT moment_id FROM inserted)
+            RETURNING moment.id, moment.like_count, moment.comment_count, moment.view_count
+        )
+        SELECT updated.id AS moment_id, TRUE AS counted,
+               updated.like_count::bigint AS like_count,
+               updated.comment_count::bigint AS comment_count,
+               updated.view_count::bigint AS view_count
+        FROM updated
+        UNION ALL
+        SELECT moment.id AS moment_id, FALSE AS counted,
+               moment.like_count::bigint AS like_count,
+               moment.comment_count::bigint AS comment_count,
+               moment.view_count::bigint AS view_count
+        FROM moment
+        WHERE moment.id = $1
+          AND NOT EXISTS (SELECT 1 FROM updated)
+        "#,
+    )
+    .bind(moment_id)
+    .bind(user_id)
+    .bind(visitor_id)
+    .bind(view_date)
+    .fetch_optional(&state.db)
+    .await;
+
+    match result {
+        Ok(Some(view_state)) => Ok((jar, Json(ApiResponse::success(view_state)))),
+        Ok(None) => {
+            let _: Result<i64, _> = redis::cmd("DEL")
+                .arg(&dedup_key)
+                .query_async(&mut redis)
+                .await;
+            Err(StatusCode::NOT_FOUND)
+        }
+        Err(error) => {
+            let _: Result<i64, _> = redis::cmd("DEL")
+                .arg(&dedup_key)
+                .query_async(&mut redis)
+                .await;
+            tracing::error!(
+                %error,
+                %moment_id,
+                %viewer_kind,
+                %viewer_id,
+                "Failed to count moment view"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+fn optional_user_id(claims: Option<Extension<Claims>>) -> Result<Option<Uuid>, StatusCode> {
+    claims
+        .map(|Extension(claims)| {
+            claims
+                .sub
+                .parse::<Uuid>()
+                .map_err(|_| StatusCode::UNAUTHORIZED)
+        })
+        .transpose()
+}
+
+fn build_moment_visitor_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+    visitor_id: Uuid,
+) -> Cookie<'static> {
+    let local = headers
+        .get(ORIGIN)
+        .or_else(|| headers.get(REFERER))
+        .or_else(|| headers.get(HOST))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value.contains("localhost") || value.contains("127.0.0.1") || value.contains("[::1]")
+        })
+        .unwrap_or_else(|| {
+            state.frontend_url.starts_with("http://localhost")
+                || state.frontend_url.starts_with("http://127.0.0.1")
+        });
+    let cookie = Cookie::build((MOMENT_VISITOR_COOKIE, visitor_id.to_string()))
+        .http_only(true)
+        .path("/")
+        .max_age(time::Duration::days(730));
+    if local {
+        cookie.secure(false).same_site(SameSite::Lax).build()
+    } else {
+        cookie.secure(true).same_site(SameSite::None).build()
+    }
+}
+
+fn moment_view_date_and_ttl(now: DateTime<Utc>) -> Option<(NaiveDate, u64)> {
+    let offset = Duration::hours(MOMENT_VIEW_UTC_OFFSET_HOURS);
+    let local_now = now + offset;
+    let view_date = local_now.date_naive();
+    let next_local_midnight = view_date.succ_opt()?.and_hms_opt(0, 0, 0)?.and_utc();
+    let next_midnight_utc = next_local_midnight - offset;
+    Some((
+        view_date,
+        (next_midnight_utc - now).num_seconds().max(1) as u64,
+    ))
+}
+
+async fn load_moment_view_state(
+    db: &sqlx::PgPool,
+    moment_id: Uuid,
+    counted: bool,
+) -> Result<Option<MomentViewState>, sqlx::Error> {
+    sqlx::query_as::<_, MomentViewState>(
+        r#"
+        SELECT id AS moment_id, $2::boolean AS counted,
+               like_count::bigint AS like_count,
+               comment_count::bigint AS comment_count,
+               view_count::bigint AS view_count
+        FROM moment
+        WHERE id = $1
+        "#,
+    )
+    .bind(moment_id)
+    .bind(counted)
+    .fetch_optional(db)
+    .await
 }
 
 pub async fn delete(
@@ -1165,7 +1371,7 @@ fn video_extension(
 mod tests {
     use super::{
         encode_moment_image, encode_video_poster, media_name_component, moment_media_paths,
-        parse_ffmpeg_out_time_us, parse_video_metadata, video_extension,
+        moment_view_date_and_ttl, parse_ffmpeg_out_time_us, parse_video_metadata, video_extension,
     };
     use crate::models::moment::MomentMedia;
     use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
@@ -1279,5 +1485,23 @@ mod tests {
             Some(12_500_000)
         );
         assert_eq!(parse_ffmpeg_out_time_us("progress=continue"), None);
+    }
+
+    #[test]
+    fn resets_moment_view_day_at_shanghai_midnight() {
+        let before_midnight = chrono::DateTime::parse_from_rfc3339("2026-07-15T15:59:59Z").unwrap();
+        let at_midnight = chrono::DateTime::parse_from_rfc3339("2026-07-15T16:00:00Z").unwrap();
+
+        assert_eq!(
+            moment_view_date_and_ttl(before_midnight.to_utc()),
+            Some((chrono::NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(), 1))
+        );
+        assert_eq!(
+            moment_view_date_and_ttl(at_midnight.to_utc()),
+            Some((
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+                86_400
+            ))
+        );
     }
 }

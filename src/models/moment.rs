@@ -16,6 +16,7 @@ pub struct Moment {
     pub processing_error: Option<String>,
     pub like_count: i64,
     pub comment_count: i64,
+    pub view_count: i64,
     pub liked: bool,
     pub comments: Json<Vec<MomentComment>>,
     pub created_at: DateTime<Utc>,
@@ -39,6 +40,15 @@ pub struct MomentLikeState {
     pub moment_id: Uuid,
     pub liked: bool,
     pub like_count: i64,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct MomentViewState {
+    pub moment_id: Uuid,
+    pub counted: bool,
+    pub like_count: i64,
+    pub comment_count: i64,
+    pub view_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
