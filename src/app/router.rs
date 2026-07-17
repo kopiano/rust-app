@@ -159,6 +159,10 @@ fn subscription_api(state: AppState) -> Router<AppState> {
             "/subscription/pro/checkout",
             post(subscription::create_pro_checkout),
         )
+        .route(
+            "/subscription/orders/{order_no}/confirm",
+            post(subscription::confirm_order),
+        )
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new()
         .route("/subscription/webhook", post(subscription::webhook))

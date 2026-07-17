@@ -1,19 +1,22 @@
 use axum::{
     Extension, Json,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::common::response::ApiResponse;
 use crate::middleware::jwt::Claims;
+use crate::models::message::{Message, MessageBroadcast};
 
 const WEBHOOK_SECRET_HEADER: &str = "x-subscription-webhook-secret";
+const SYSTEM_USER_EMAIL: &str = "system@internal.local";
 
 #[derive(Debug, Deserialize)]
 pub struct CheckoutInput {
@@ -21,11 +24,13 @@ pub struct CheckoutInput {
     pub payment_method: Option<String>,
     pub contact_email: Option<String>,
     pub currency: Option<String>,
+    pub billing_cycle: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CheckoutResponse {
-    pub checkout_url: String,
+    pub order_no: String,
+    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,9 +51,9 @@ pub async fn create_pro_checkout(
         Ok(user_id) => user_id,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
-    let return_to = normalize_return_to(input.return_to.as_deref());
     let payment_method = normalize_payment_method(input.payment_method.as_deref());
     let currency = normalize_currency(input.currency.as_deref());
+    let billing_cycle = normalize_billing_cycle(input.billing_cycle.as_deref());
     let contact_email = match normalize_contact_email(input.contact_email.as_deref()) {
         Ok(contact_email) => contact_email,
         Err(message) => {
@@ -59,25 +64,283 @@ pub async fn create_pro_checkout(
                 .into_response();
         }
     };
-    let checkout_url = match build_checkout_url(
-        &state,
-        user_id,
-        &return_to,
-        payment_method,
-        contact_email.as_deref(),
-        currency,
-    ) {
-        Ok(url) => url,
-        Err((status, message)) => {
+
+    let mut transaction = match state.db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!(%error, "Failed to start payment order transaction");
             return (
-                status,
-                Json(ApiResponse::<()>::error(status.as_u16(), message)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<()>::error(
+                    500,
+                    "Unable to create payment order.",
+                )),
             )
                 .into_response();
         }
     };
+    let system_user_id = match system_user_id(&mut transaction).await {
+        Ok(system_user_id) => system_user_id,
+        Err(error) => {
+            tracing::error!(%error, "System notification account is missing");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::<()>::error(
+                    503,
+                    "System notifications are not configured.",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let administrators = match admin_users(&mut transaction).await {
+        Ok(administrators) if !administrators.is_empty() => administrators,
+        Ok(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ApiResponse::<()>::error(
+                    503,
+                    "No payment administrator is configured.",
+                )),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!(%error, "Failed to load payment administrators");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let purchaser = match sqlx::query_as::<_, (String, String)>(
+        r#"SELECT name, email FROM "user" WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    {
+        Ok(Some(purchaser)) => purchaser,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %user_id, "Failed to load payment user");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
-    Json(ApiResponse::success(CheckoutResponse { checkout_url })).into_response()
+    let order_no = create_order_no();
+    let amount = price_for(currency, billing_cycle);
+    let order_created = sqlx::query(
+        r#"
+        INSERT INTO subscription_order (
+            order_no, user_id, plan, billing_cycle, payment_method, currency, amount, contact_email
+        )
+        VALUES ($1, $2, 'pro', $3, $4, $5, $6::numeric, $7)
+        "#,
+    )
+    .bind(&order_no)
+    .bind(user_id)
+    .bind(billing_cycle)
+    .bind(payment_method)
+    .bind(currency)
+    .bind(amount)
+    .bind(contact_email.as_deref())
+    .execute(&mut *transaction)
+    .await;
+    if let Err(error) = order_created {
+        tracing::error!(%error, %user_id, "Failed to create payment order");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let user_content = format!(
+        "你的 Pro 支付申请已提交，订单号：{order_no}，金额：{currency} {amount}。请完成支付，管理员确认到账后将为你开通 Pro 权限。"
+    );
+    let mut broadcasts = Vec::with_capacity(administrators.len() + 1);
+    match insert_system_private_message(
+        &mut transaction,
+        system_user_id,
+        user_id,
+        &order_no,
+        "purchaser",
+        user_content,
+    )
+    .await
+    {
+        Ok(message) => broadcasts.push((message, vec![system_user_id, user_id])),
+        Err(error) => {
+            tracing::error!(%error, %order_no, "Failed to notify payment user");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+    for (admin_id, admin_name) in administrators {
+        let admin_content = format!(
+            "待确认 Pro 支付\n用户：{} ({})\n订单号：{order_no}\n套餐：Pro {}\n支付方式：{}\n金额：{} {}\n请在确认到账后发放权限。",
+            purchaser.0,
+            purchaser.1,
+            billing_cycle_label(billing_cycle),
+            payment_method_label(payment_method),
+            currency,
+            amount,
+        );
+        match insert_system_private_message(
+            &mut transaction,
+            system_user_id,
+            admin_id,
+            &order_no,
+            &format!("admin:{admin_name}"),
+            admin_content,
+        )
+        .await
+        {
+            Ok(message) => broadcasts.push((message, vec![system_user_id, admin_id])),
+            Err(error) => {
+                tracing::error!(%error, %order_no, "Failed to notify payment administrator");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+    if let Err(error) = transaction.commit().await {
+        tracing::error!(%error, %order_no, "Failed to commit payment order");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    broadcast_messages(&state, broadcasts);
+
+    Json(ApiResponse::success(CheckoutResponse {
+        order_no,
+        status: "pending_confirmation".to_string(),
+    }))
+    .into_response()
+}
+
+pub async fn confirm_order(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(order_no): Path<String>,
+) -> Response {
+    let administrator_id = match claims.sub.parse::<Uuid>() {
+        Ok(user_id) => user_id,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if !valid_order_no(&order_no) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let is_admin =
+        match sqlx::query_scalar::<_, bool>(r#"SELECT is_admin FROM "user" WHERE id = $1"#)
+            .bind(administrator_id)
+            .fetch_optional(&state.db)
+            .await
+        {
+            Ok(Some(is_admin)) => is_admin,
+            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+            Err(error) => {
+                tracing::error!(%error, %administrator_id, "Failed to check payment administrator");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    if !is_admin {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+
+    let mut transaction = match state.db.begin().await {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            tracing::error!(%error, "Failed to start payment confirmation transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let order = match sqlx::query_as::<_, (Uuid, String)>(
+        r#"
+        SELECT user_id, billing_cycle
+        FROM subscription_order
+        WHERE order_no = $1 AND status = 'pending_confirmation'
+        FOR UPDATE
+        "#,
+    )
+    .bind(&order_no)
+    .fetch_optional(&mut *transaction)
+    .await
+    {
+        Ok(Some(order)) => order,
+        Ok(None) => return StatusCode::CONFLICT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %order_no, "Failed to load payment order");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let subscription_end_at = Utc::now()
+        + if order.1 == "yearly" {
+            Duration::days(365)
+        } else {
+            Duration::days(30)
+        };
+    if let Err(error) = sqlx::query(
+        r#"
+        UPDATE "user"
+        SET plan = 'pro',
+            subscription_status = 'active',
+            subscription_start_at = NOW(),
+            subscription_end_at = $2,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(order.0)
+    .bind(subscription_end_at)
+    .execute(&mut *transaction)
+    .await
+    {
+        tracing::error!(%error, %order_no, "Failed to activate Pro subscription");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(error) = sqlx::query(
+        r#"
+        UPDATE subscription_order
+        SET status = 'succeeded',
+            confirmed_by = $2,
+            confirmed_at = NOW(),
+            updated_at = NOW()
+        WHERE order_no = $1
+        "#,
+    )
+    .bind(&order_no)
+    .bind(administrator_id)
+    .execute(&mut *transaction)
+    .await
+    {
+        tracing::error!(%error, %order_no, "Failed to confirm payment order");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let system_user_id = match system_user_id(&mut transaction).await {
+        Ok(system_user_id) => system_user_id,
+        Err(error) => {
+            tracing::error!(%error, "System notification account is missing");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let message = match insert_system_private_message(
+        &mut transaction,
+        system_user_id,
+        order.0,
+        &order_no,
+        "confirmed",
+        format!("你的 Pro 支付已确认，权限现已开通。订单号：{order_no}。"),
+    )
+    .await
+    {
+        Ok(message) => message,
+        Err(error) => {
+            tracing::error!(%error, %order_no, "Failed to send payment confirmation message");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if let Err(error) = transaction.commit().await {
+        tracing::error!(%error, %order_no, "Failed to commit payment confirmation");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    broadcast_messages(&state, vec![(message, vec![system_user_id, order.0])]);
+    Json(ApiResponse::success(serde_json::json!({
+        "order_no": order_no,
+        "status": "succeeded",
+        "subscription_end_at": subscription_end_at,
+    })))
+    .into_response()
 }
 
 pub async fn webhook(
@@ -170,6 +433,117 @@ pub async fn webhook(
     }
 }
 
+async fn system_user_id(transaction: &mut Transaction<'_, Postgres>) -> Result<Uuid, sqlx::Error> {
+    sqlx::query_scalar(r#"SELECT id FROM "user" WHERE email = $1"#)
+        .bind(SYSTEM_USER_EMAIL)
+        .fetch_one(&mut **transaction)
+        .await
+}
+
+async fn admin_users(
+    transaction: &mut Transaction<'_, Postgres>,
+) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
+    sqlx::query_as(r#"SELECT id, name FROM "user" WHERE is_admin = TRUE ORDER BY name"#)
+        .fetch_all(&mut **transaction)
+        .await
+}
+
+async fn insert_system_private_message(
+    transaction: &mut Transaction<'_, Postgres>,
+    system_user_id: Uuid,
+    receiver_id: Uuid,
+    order_no: &str,
+    notification_kind: &str,
+    content: String,
+) -> Result<Message, sqlx::Error> {
+    let (first, second) = if system_user_id.as_bytes() <= receiver_id.as_bytes() {
+        (system_user_id, receiver_id)
+    } else {
+        (receiver_id, system_user_id)
+    };
+    let conversation_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("private:{first}:{second}").as_bytes(),
+    );
+    let client_message_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("subscription:{order_no}:{notification_kind}:{receiver_id}").as_bytes(),
+    );
+
+    sqlx::query_as::<_, Message>(
+        r#"
+        INSERT INTO "message" (
+            conversation_id, chat_type, send_id, client_message_id,
+            receiver_id, content, message_type, status
+        )
+        VALUES ($1, 'private', $2, $3, $4, $5, 3, 'sent')
+        ON CONFLICT (send_id, client_message_id) DO UPDATE
+            SET id = "message".id
+        RETURNING id, conversation_id, chat_type, send_id, receiver_id, group_id,
+                  client_message_id, content, message_type, status, created_at, update_at, deleted_at,
+                  file_name, file_url
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(system_user_id)
+    .bind(client_message_id)
+    .bind(receiver_id)
+    .bind(content)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+fn broadcast_messages(state: &AppState, messages: Vec<(Message, Vec<Uuid>)>) {
+    for (message, recipients) in messages {
+        let _ = state.message_tx.send(MessageBroadcast {
+            event: "message",
+            message,
+            recipients,
+        });
+    }
+}
+
+fn create_order_no() -> String {
+    format!(
+        "PRO{}{}",
+        Utc::now().format("%Y%m%d%H%M%S"),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn price_for(currency: &str, billing_cycle: &str) -> &'static str {
+    match (currency, billing_cycle) {
+        ("USD", "yearly") => "0.1470",
+        ("USD", _) => "0.0147",
+        ("CNY", "yearly") => "1.0000",
+        _ => "0.1000",
+    }
+}
+
+fn billing_cycle_label(cycle: &str) -> &'static str {
+    if cycle == "yearly" {
+        "年付"
+    } else {
+        "月付"
+    }
+}
+
+fn payment_method_label(payment_method: &str) -> &'static str {
+    match payment_method {
+        "alipay" => "支付宝",
+        "union_pay" => "云闪付",
+        _ => "微信支付",
+    }
+}
+
+fn valid_order_no(order_no: &str) -> bool {
+    !order_no.is_empty()
+        && order_no.len() <= 64
+        && order_no
+            .bytes()
+            .all(|character| character.is_ascii_alphanumeric() || character == b'-')
+}
+
 fn build_checkout_url(
     state: &AppState,
     user_id: Uuid,
@@ -257,6 +631,18 @@ fn normalize_currency(value: Option<&str>) -> &'static str {
     }
 }
 
+fn normalize_billing_cycle(value: Option<&str>) -> &'static str {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "yearly" => "yearly",
+        _ => "monthly",
+    }
+}
+
 fn normalize_contact_email(value: Option<&str>) -> Result<Option<String>, &'static str> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
@@ -278,8 +664,8 @@ fn valid_plan(plan: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_contact_email, normalize_currency, normalize_payment_method, normalize_return_to,
-        valid_plan,
+        normalize_billing_cycle, normalize_contact_email, normalize_currency,
+        normalize_payment_method, normalize_return_to, valid_order_no, valid_plan,
     };
 
     #[test]
@@ -313,6 +699,20 @@ mod tests {
         assert_eq!(normalize_currency(Some("usd")), "USD");
         assert_eq!(normalize_currency(Some("unknown")), "CNY");
         assert_eq!(normalize_currency(None), "CNY");
+    }
+
+    #[test]
+    fn billing_cycle_is_limited_to_checkout_options() {
+        assert_eq!(normalize_billing_cycle(Some("yearly")), "yearly");
+        assert_eq!(normalize_billing_cycle(Some("monthly")), "monthly");
+        assert_eq!(normalize_billing_cycle(Some("unknown")), "monthly");
+    }
+
+    #[test]
+    fn order_number_has_a_conservative_character_set() {
+        assert!(valid_order_no("PRO20260717123000a1b2"));
+        assert!(!valid_order_no(""));
+        assert!(!valid_order_no("../../order"));
     }
 
     #[test]
