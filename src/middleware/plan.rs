@@ -5,14 +5,22 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::app::AppState;
 use crate::common::response::ApiResponse;
 use crate::middleware::jwt::Claims;
 
-pub fn has_library_access(plan: &str) -> bool {
-    matches!(plan.trim().to_ascii_lowercase().as_str(), "pro" | "plus")
+pub fn has_library_access(
+    plan: &str,
+    subscription_status: &str,
+    subscription_end_at: Option<DateTime<Utc>>,
+) -> bool {
+    let paid_plan = matches!(plan.trim().to_ascii_lowercase().as_str(), "pro" | "plus");
+    let active = subscription_status.trim().eq_ignore_ascii_case("active");
+    let not_expired = subscription_end_at.is_none_or(|end_at| end_at > Utc::now());
+    paid_plan && active && not_expired
 }
 
 fn requested_library_owner(query: Option<&str>) -> Option<Uuid> {
@@ -43,12 +51,14 @@ pub async fn require_library_access(
         return next.run(req).await;
     }
 
-    let plan = match sqlx::query_scalar::<_, String>(r#"SELECT plan FROM "user" WHERE id = $1"#)
-        .bind(user_id)
-        .fetch_optional(&state.db)
-        .await
+    let subscription = match sqlx::query_as::<_, (String, String, Option<DateTime<Utc>>)>(
+        r#"SELECT plan, subscription_status, subscription_end_at FROM "user" WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
     {
-        Ok(Some(plan)) => plan,
+        Ok(Some(subscription)) => subscription,
         Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
         Err(error) => {
             tracing::error!(%error, %user_id, "Failed to check library plan");
@@ -56,7 +66,7 @@ pub async fn require_library_access(
         }
     };
 
-    if !has_library_access(&plan) {
+    if !has_library_access(&subscription.0, &subscription.1, subscription.2) {
         return (
             StatusCode::FORBIDDEN,
             Json(ApiResponse::<()>::error(
@@ -73,14 +83,24 @@ pub async fn require_library_access(
 #[cfg(test)]
 mod tests {
     use super::{has_library_access, requested_library_owner};
+    use chrono::{Duration, Utc};
     use uuid::Uuid;
 
     #[test]
     fn library_access_is_limited_to_paid_plans() {
-        assert!(has_library_access("pro"));
-        assert!(has_library_access("PLUS"));
-        assert!(!has_library_access("free"));
-        assert!(!has_library_access("trial"));
+        assert!(has_library_access("pro", "active", None));
+        assert!(has_library_access(
+            "PLUS",
+            "active",
+            Some(Utc::now() + Duration::days(1))
+        ));
+        assert!(!has_library_access("free", "active", None));
+        assert!(!has_library_access("pro", "expired", None));
+        assert!(!has_library_access(
+            "pro",
+            "active",
+            Some(Utc::now() - Duration::days(1))
+        ));
     }
 
     #[test]

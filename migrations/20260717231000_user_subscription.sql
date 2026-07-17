@@ -1,0 +1,4 @@
+ALTER TABLE "user"
+ADD COLUMN IF NOT EXISTS subscription_status VARCHAR(20) NOT NULL DEFAULT 'active',
+ADD COLUMN IF NOT EXISTS subscription_start_at TIMESTAMPTZ,
+ADD COLUMN IF NOT EXISTS subscription_end_at TIMESTAMPTZ;

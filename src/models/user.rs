@@ -11,6 +11,9 @@ pub struct User {
     pub github_id: Option<String>,
     pub avatar: Option<String>,
     pub plan: String,
+    pub subscription_status: String,
+    pub subscription_start_at: Option<DateTime<Utc>>,
+    pub subscription_end_at: Option<DateTime<Utc>>,
     pub last_login_at: Option<DateTime<Utc>>,
     #[serde(skip)]
     pub password_hash: String,

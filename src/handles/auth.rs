@@ -43,7 +43,7 @@ pub async fn register(
     let user = sqlx::query_as::<_, User>(
         r##"INSERT INTO "user" (name, email, password_hash, last_login_at)
          VALUES ($1, $2, $3, NOW())
-         RETURNING id, name, email, github_id, avatar, plan, last_login_at, password_hash, created_at, updated_at"##,
+         RETURNING id, name, email, github_id, avatar, plan, subscription_status, subscription_start_at, subscription_end_at, last_login_at, password_hash, created_at, updated_at"##,
     )
     .bind(name)
     .bind(email)
@@ -93,7 +93,7 @@ pub async fn login(
     }
     // sql
     let user = sqlx::query_as::<_, User>(
-        r##"SELECT id, name, email, github_id, avatar, plan, last_login_at, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
+        r##"SELECT id, name, email, github_id, avatar, plan, subscription_status, subscription_start_at, subscription_end_at, last_login_at, password_hash, created_at, updated_at FROM "user" WHERE name = $1"##,
     )
     .bind(username)
     .fetch_optional(&state.db)
@@ -351,7 +351,7 @@ async fn github_callback_inner(
             avatar = EXCLUDED.avatar,
             last_login_at = NOW(),
             updated_at = NOW()
-        RETURNING id, name, email, github_id, avatar, plan, last_login_at, password_hash, created_at, updated_at"##)
+        RETURNING id, name, email, github_id, avatar, plan, subscription_status, subscription_start_at, subscription_end_at, last_login_at, password_hash, created_at, updated_at"##)
         .bind(&github.login)
         .bind(&email)
         .bind("")
