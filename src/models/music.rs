@@ -51,6 +51,17 @@ pub struct MusicListPage {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MusicLibraryItem {
+    pub collection: String,
+    pub user_id: Uuid,
+    pub username: String,
+    pub avatar: Option<String>,
+    pub playlist_name: String,
+    pub track_count: i64,
+    pub total_duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct MusicProcessingBroadcast {
     #[serde(skip)]
     pub user_id: Uuid,

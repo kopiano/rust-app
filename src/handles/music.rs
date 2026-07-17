@@ -28,8 +28,8 @@ use crate::{
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::music::{
-        Music, MusicFavoriteState, MusicListItem, MusicListPage, MusicProcessingBroadcast,
-        UpdateMusicFavorite,
+        Music, MusicFavoriteState, MusicLibraryItem, MusicListItem, MusicListPage,
+        MusicProcessingBroadcast, UpdateMusicFavorite,
     },
     services::ncm::{self, DecryptedNcm},
 };
@@ -135,12 +135,43 @@ pub struct MusicListQuery {
     #[serde(alias = "pagesize")]
     page_size: Option<i64>,
     favorite: Option<bool>,
+    collection: Option<MusicCollection>,
+    user_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum MusicCollection {
+    Uploads,
+    Favorites,
+    Library,
+}
+
+impl MusicCollection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Uploads => "uploads",
+            Self::Favorites => "favorites",
+            Self::Library => "library",
+        }
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct MusicListStats {
     total: i64,
     total_duration_ms: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MusicLibraryRow {
+    user_id: Uuid,
+    username: String,
+    avatar: Option<String>,
+    upload_count: i64,
+    upload_duration_ms: i64,
+    favorite_count: i64,
+    favorite_duration_ms: i64,
 }
 
 impl MusicListQuery {
@@ -152,9 +183,52 @@ impl MusicListQuery {
     }
 }
 
+const PLAYLIST_ADJECTIVES: [&str; 24] = [
+    "Amber", "Bright", "Calm", "Crystal", "Dreamy", "Electric", "Golden", "Hidden", "Indigo",
+    "Infinite", "Lunar", "Midnight", "Neon", "Quiet", "Radiant", "Silver", "Soft", "Solar",
+    "Velvet", "Vivid", "Warm", "Wild", "Wistful", "Young",
+];
+const PLAYLIST_NOUNS: [&str; 24] = [
+    "Airwaves",
+    "Beats",
+    "Bloom",
+    "Echoes",
+    "Frequencies",
+    "Grooves",
+    "Harmony",
+    "Horizon",
+    "Melodies",
+    "Memories",
+    "Motion",
+    "Nights",
+    "Pulse",
+    "Rhythms",
+    "Signals",
+    "Skies",
+    "Sounds",
+    "Stories",
+    "Sunset",
+    "Tapes",
+    "Tempo",
+    "Tracks",
+    "Voyage",
+    "Waves",
+];
+
+fn playlist_name_for_user(user_id: Uuid) -> String {
+    let bytes = user_id.as_bytes();
+    let adjective_index = usize::from(bytes[0] ^ bytes[7]) % PLAYLIST_ADJECTIVES.len();
+    let noun_index = usize::from(bytes[8] ^ bytes[15]) % PLAYLIST_NOUNS.len();
+    format!(
+        "{} {}",
+        PLAYLIST_ADJECTIVES[adjective_index], PLAYLIST_NOUNS[noun_index]
+    )
+}
+
 #[cfg(test)]
 mod music_list_query_tests {
-    use super::MusicListQuery;
+    use super::{MusicCollection, MusicListQuery, playlist_name_for_user};
+    use uuid::Uuid;
 
     #[test]
     fn pagination_uses_defaults_and_clamps_limits() {
@@ -162,6 +236,8 @@ mod music_list_query_tests {
             page: None,
             page_size: None,
             favorite: None,
+            collection: None,
+            user_id: None,
         };
         assert_eq!(defaults.pagination(), (1, 10, 0));
 
@@ -169,6 +245,8 @@ mod music_list_query_tests {
             page: Some(0),
             page_size: Some(100),
             favorite: Some(true),
+            collection: Some(MusicCollection::Favorites),
+            user_id: None,
         };
         assert_eq!(clamped.pagination(), (1, 50, 0));
 
@@ -176,27 +254,149 @@ mod music_list_query_tests {
             page: Some(2),
             page_size: Some(8),
             favorite: None,
+            collection: Some(MusicCollection::Uploads),
+            user_id: Some(Uuid::nil()),
         };
         assert_eq!(second_page.pagination(), (2, 8, 8));
     }
+
+    #[test]
+    fn playlist_name_is_stable_and_contains_two_words() {
+        let user_id = Uuid::parse_str("f2ce692c-dc82-49b9-a2ad-f3d971d43f91").unwrap();
+        let first = playlist_name_for_user(user_id);
+        let second = playlist_name_for_user(user_id);
+
+        assert_eq!(first, second);
+        assert_eq!(first.split_whitespace().count(), 2);
+    }
+}
+
+pub async fn library(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<ApiResponse<Vec<MusicLibraryItem>>>, StatusCode> {
+    let viewer_user_id = authenticated_user_id(&claims)?;
+    let rows = sqlx::query_as::<_, MusicLibraryRow>(
+        r#"
+        SELECT "user".id AS user_id,
+               "user".name AS username,
+               "user".avatar,
+               (
+                   SELECT COUNT(*)::BIGINT
+                   FROM music
+                   WHERE music.user_id = "user".id
+                     AND music.processing_status <> 'failed'
+               ) AS upload_count,
+               (
+                   SELECT COALESCE(SUM(music.duration_ms), 0)::BIGINT
+                   FROM music
+                   WHERE music.user_id = "user".id
+                     AND music.processing_status <> 'failed'
+               ) AS upload_duration_ms,
+               (
+                   SELECT COUNT(*)::BIGINT
+                   FROM music_favorite
+                   INNER JOIN music ON music.id = music_favorite.music_id
+                   WHERE music_favorite.user_id = "user".id
+                     AND music.processing_status <> 'failed'
+               ) AS favorite_count,
+               (
+                   SELECT COALESCE(SUM(music.duration_ms), 0)::BIGINT
+                   FROM music_favorite
+                   INNER JOIN music ON music.id = music_favorite.music_id
+                   WHERE music_favorite.user_id = "user".id
+                     AND music.processing_status <> 'failed'
+               ) AS favorite_duration_ms
+        FROM "user"
+        WHERE EXISTS (
+                  SELECT 1
+                  FROM music
+                  WHERE music.user_id = "user".id
+                    AND music.processing_status <> 'failed'
+              )
+           OR EXISTS (
+                  SELECT 1
+                  FROM music_favorite
+                  INNER JOIN music ON music.id = music_favorite.music_id
+                  WHERE music_favorite.user_id = "user".id
+                    AND music.processing_status <> 'failed'
+              )
+        ORDER BY CASE WHEN "user".id = $1 THEN 0 ELSE 1 END,
+                 LOWER("user".name),
+                 "user".id
+        "#,
+    )
+    .bind(viewer_user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %viewer_user_id, "Failed to list music libraries");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut libraries = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        if row.upload_count > 0 {
+            libraries.push(MusicLibraryItem {
+                collection: MusicCollection::Uploads.as_str().to_string(),
+                user_id: row.user_id,
+                username: row.username.clone(),
+                avatar: row.avatar.clone(),
+                playlist_name: playlist_name_for_user(row.user_id),
+                track_count: row.upload_count,
+                total_duration_ms: row.upload_duration_ms,
+            });
+        }
+        if row.favorite_count > 0 {
+            libraries.push(MusicLibraryItem {
+                collection: MusicCollection::Favorites.as_str().to_string(),
+                user_id: row.user_id,
+                username: row.username,
+                avatar: row.avatar,
+                playlist_name: "My Favority".to_string(),
+                track_count: row.favorite_count,
+                total_duration_ms: row.favorite_duration_ms,
+            });
+        }
+    }
+
+    Ok(Json(ApiResponse::success(libraries)))
 }
 
 pub async fn public_list(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
     Query(query): Query<MusicListQuery>,
 ) -> Result<Json<ApiResponse<MusicListPage>>, StatusCode> {
+    let user_id = claims.and_then(|Extension(claims)| authenticated_user_id(&claims).ok());
     let (page, page_size, offset) = query.pagination();
     let items_query = sqlx::query_as::<_, MusicListItem>(
         r#"
-        SELECT id, title, artist, album, duration_ms, cover_url, is_favorite,
-               processing_status, processing_error, created_at
+        SELECT music.id, music.title, music.artist, music.album, music.duration_ms,
+               music.cover_url,
+               EXISTS (
+                   SELECT 1
+                   FROM music_favorite
+                   WHERE music_favorite.user_id = $1
+                     AND music_favorite.music_id = music.id
+               ) AS is_favorite,
+               music.processing_status, music.processing_error, music.created_at
         FROM music
-        WHERE processing_status <> 'failed'
-          AND ($1::BOOLEAN IS NULL OR is_favorite = $1)
-        ORDER BY created_at DESC, id DESC
-        LIMIT $2 OFFSET $3
+        WHERE music.processing_status <> 'failed'
+          AND (
+              $2::BOOLEAN IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM music_favorite
+                  WHERE music_favorite.user_id = $1
+                    AND music_favorite.music_id = music.id
+              ) = $2
+          )
+        ORDER BY music.created_at DESC, music.id DESC
+        LIMIT $3 OFFSET $4
         "#,
     )
+    .bind(user_id)
     .bind(query.favorite)
     .bind(page_size)
     .bind(offset)
@@ -204,12 +404,21 @@ pub async fn public_list(
     let stats_query = sqlx::query_as::<_, MusicListStats>(
         r#"
         SELECT COUNT(*)::BIGINT AS total,
-               COALESCE(SUM(duration_ms), 0)::BIGINT AS total_duration_ms
+               COALESCE(SUM(music.duration_ms), 0)::BIGINT AS total_duration_ms
         FROM music
-        WHERE processing_status <> 'failed'
-          AND ($1::BOOLEAN IS NULL OR is_favorite = $1)
+        WHERE music.processing_status <> 'failed'
+          AND (
+              $2::BOOLEAN IS NULL
+              OR EXISTS (
+                  SELECT 1
+                  FROM music_favorite
+                  WHERE music_favorite.user_id = $1
+                    AND music_favorite.music_id = music.id
+              ) = $2
+          )
         "#,
     )
+    .bind(user_id)
     .bind(query.favorite)
     .fetch_one(&state.db);
 
@@ -225,19 +434,30 @@ pub async fn public_list(
 
 pub async fn public_get(
     State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ApiResponse<Music>>, StatusCode> {
+    let user_id = claims.and_then(|Extension(claims)| authenticated_user_id(&claims).ok());
     let music = sqlx::query_as::<_, Music>(
         r#"
-        SELECT id, title, artist, album, duration_ms, bitrate, sample_rate,
-               cover_url, audio_url, original_url, format, original_format,
-               size, original_size, is_favorite, processing_status,
-               processing_error, created_at, updated_at
+        SELECT music.id, music.title, music.artist, music.album, music.duration_ms,
+               music.bitrate, music.sample_rate, music.cover_url, music.audio_url,
+               music.original_url, music.format, music.original_format, music.size,
+               music.original_size,
+               EXISTS (
+                   SELECT 1
+                   FROM music_favorite
+                   WHERE music_favorite.user_id = $2
+                     AND music_favorite.music_id = music.id
+               ) AS is_favorite,
+               music.processing_status, music.processing_error, music.created_at,
+               music.updated_at
         FROM music
-        WHERE id = $1
+        WHERE music.id = $1
         "#,
     )
     .bind(id)
+    .bind(user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|error| {
@@ -254,41 +474,106 @@ pub async fn list(
     Extension(claims): Extension<Claims>,
     Query(query): Query<MusicListQuery>,
 ) -> Result<Json<ApiResponse<MusicListPage>>, StatusCode> {
-    let user_id = authenticated_user_id(&claims)?;
+    let viewer_user_id = authenticated_user_id(&claims)?;
+    let owner_user_id = query.user_id.unwrap_or(viewer_user_id);
     let (page, page_size, offset) = query.pagination();
+    let collection = query.collection.unwrap_or_else(|| {
+        if query.favorite == Some(true) {
+            MusicCollection::Favorites
+        } else {
+            MusicCollection::Uploads
+        }
+    });
     let items_query = sqlx::query_as::<_, MusicListItem>(
         r#"
-        SELECT id, title, artist, album, duration_ms, cover_url, is_favorite,
-               processing_status, processing_error, created_at
+        SELECT music.id, music.title, music.artist, music.album, music.duration_ms,
+               music.cover_url,
+               EXISTS (
+                   SELECT 1
+                   FROM music_favorite
+                   WHERE music_favorite.user_id = $1
+                     AND music_favorite.music_id = music.id
+               ) AS is_favorite,
+               music.processing_status, music.processing_error, music.created_at
         FROM music
-        WHERE user_id = $1
-          AND processing_status <> 'failed'
-          AND ($2::BOOLEAN IS NULL OR is_favorite = $2)
-        ORDER BY created_at DESC, id DESC
-        LIMIT $3 OFFSET $4
+        WHERE music.processing_status <> 'failed'
+          AND (
+              ($3 = 'uploads' AND music.user_id = $2)
+              OR (
+                  $3 = 'favorites'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM music_favorite
+                      WHERE music_favorite.user_id = $2
+                        AND music_favorite.music_id = music.id
+                  )
+              )
+              OR (
+                  $3 = 'library'
+                  AND (
+                      music.user_id = $2
+                      OR EXISTS (
+                          SELECT 1
+                          FROM music_favorite
+                          WHERE music_favorite.user_id = $2
+                            AND music_favorite.music_id = music.id
+                      )
+                  )
+              )
+          )
+        ORDER BY music.created_at DESC, music.id DESC
+        LIMIT $4 OFFSET $5
         "#,
     )
-    .bind(user_id)
-    .bind(query.favorite)
+    .bind(viewer_user_id)
+    .bind(owner_user_id)
+    .bind(collection.as_str())
     .bind(page_size)
     .bind(offset)
     .fetch_all(&state.db);
     let stats_query = sqlx::query_as::<_, MusicListStats>(
         r#"
         SELECT COUNT(*)::BIGINT AS total,
-               COALESCE(SUM(duration_ms), 0)::BIGINT AS total_duration_ms
+               COALESCE(SUM(music.duration_ms), 0)::BIGINT AS total_duration_ms
         FROM music
-        WHERE user_id = $1
-          AND processing_status <> 'failed'
-          AND ($2::BOOLEAN IS NULL OR is_favorite = $2)
+        WHERE music.processing_status <> 'failed'
+          AND (
+              ($2 = 'uploads' AND music.user_id = $1)
+              OR (
+                  $2 = 'favorites'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM music_favorite
+                      WHERE music_favorite.user_id = $1
+                        AND music_favorite.music_id = music.id
+                  )
+              )
+              OR (
+                  $2 = 'library'
+                  AND (
+                      music.user_id = $1
+                      OR EXISTS (
+                          SELECT 1
+                          FROM music_favorite
+                          WHERE music_favorite.user_id = $1
+                            AND music_favorite.music_id = music.id
+                      )
+                  )
+              )
+          )
         "#,
     )
-    .bind(user_id)
-    .bind(query.favorite)
+    .bind(owner_user_id)
+    .bind(collection.as_str())
     .fetch_one(&state.db);
 
     let (items, stats) = tokio::try_join!(items_query, stats_query).map_err(|error| {
-        tracing::error!(%error, %user_id, "Failed to list music");
+        tracing::error!(
+            %error,
+            %viewer_user_id,
+            %owner_user_id,
+            "Failed to list music"
+        );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
@@ -529,26 +814,64 @@ pub async fn favorite(
     Json(input): Json<UpdateMusicFavorite>,
 ) -> Result<Json<ApiResponse<MusicFavoriteState>>, StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let state = sqlx::query_as::<_, MusicFavoriteState>(
+    let music_exists = sqlx::query_scalar::<_, bool>(
         r#"
-        UPDATE music
-        SET is_favorite = $1, updated_at = NOW()
-        WHERE id = $2 AND user_id = $3
-        RETURNING id, is_favorite
+        SELECT EXISTS (
+            SELECT 1
+            FROM music
+            WHERE id = $1
+              AND processing_status <> 'failed'
+        )
         "#,
     )
-    .bind(input.favorite)
     .bind(id)
-    .bind(user_id)
-    .fetch_optional(&state.db)
+    .fetch_one(&state.db)
     .await
     .map_err(|error| {
-        tracing::error!(%error, %user_id, music_id = %id, "Failed to update music favorite");
+        tracing::error!(%error, %user_id, music_id = %id, "Failed to check music before favorite update");
         StatusCode::INTERNAL_SERVER_ERROR
-    })?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    })?;
+    if !music_exists {
+        return Err(StatusCode::NOT_FOUND);
+    }
 
-    Ok(Json(ApiResponse::success(state)))
+    if input.favorite {
+        sqlx::query(
+            r#"
+            INSERT INTO music_favorite (user_id, music_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id, music_id) DO NOTHING
+            "#,
+        )
+        .bind(user_id)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %user_id, music_id = %id, "Failed to favorite music");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    } else {
+        sqlx::query(
+            r#"
+            DELETE FROM music_favorite
+            WHERE user_id = $1 AND music_id = $2
+            "#,
+        )
+        .bind(user_id)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %user_id, music_id = %id, "Failed to remove music favorite");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    }
+
+    Ok(Json(ApiResponse::success(MusicFavoriteState {
+        id,
+        is_favorite: input.favorite,
+    })))
 }
 
 pub async fn delete(
