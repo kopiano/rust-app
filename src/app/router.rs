@@ -125,8 +125,15 @@ fn moment_api(state: AppState) -> Router<AppState> {
 }
 
 fn music_api(state: AppState) -> Router<AppState> {
-    Router::new()
-        .route("/music", get(music::list).post(music::upload).layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES)))
+    let public = Router::new()
+        .route("/music/list", get(music::public_list))
+        .route("/music/{id}", get(music::public_get));
+    let private = Router::new()
+        .route("/music", get(music::list))
+        .route("/music/upload", post(music::upload).layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES)))
+        .route("/music/ws", get(music::websocket))
+        .route("/music/{id}", axum::routing::delete(music::delete))
         .route("/music/{id}/favorite", put(music::favorite))
-        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new().merge(public).merge(private)
 }

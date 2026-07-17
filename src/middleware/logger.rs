@@ -12,9 +12,9 @@ pub async fn logger(req: Request, next: Next) -> Response {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let log_request_id = short_id(&request_id);
     let method = req.method().as_str().to_owned();
-    let path = log_path(req.uri().path());
+    let path = req.uri().path().to_owned();
+    let terminal_path = log_path(&path);
     let ip = req
         .headers()
         .get("CF-Connecting-IP")
@@ -39,23 +39,51 @@ pub async fn logger(req: Request, next: Next) -> Response {
     if let Ok(value) = request_id.parse() {
         response.headers_mut().insert("X-Request-ID", value);
     }
-    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S");
-    let level = if status >= 500 {
-        "ERROR"
-    } else if status >= 400 {
-        "WARN"
-    } else {
-        "INFO"
-    };
-    let identity = user_id
-        .map(|id| format!(" user={}", short_id(&id)))
-        .unwrap_or_default();
-    println!(
-        "[{timestamp}] {level:<5} {method:<6} {path:<36} ({status:<3}) {latency_ms:<4.0}ms ip={ip}{identity} request_id={log_request_id}"
-    );
+    match status {
+        500..=u16::MAX => tracing::error!(
+            target: "app::http",
+            http = true,
+            %method,
+            %path,
+            %terminal_path,
+            status,
+            latency_ms,
+            user_id = user_id.as_deref().unwrap_or(""),
+            %ip,
+            %request_id,
+            "HTTP request"
+        ),
+        400..=499 => tracing::warn!(
+            target: "app::http",
+            http = true,
+            %method,
+            %path,
+            %terminal_path,
+            status,
+            latency_ms,
+            user_id = user_id.as_deref().unwrap_or(""),
+            %ip,
+            %request_id,
+            "HTTP request"
+        ),
+        _ => tracing::info!(
+            target: "app::http",
+            http = true,
+            %method,
+            %path,
+            %terminal_path,
+            status,
+            latency_ms,
+            user_id = user_id.as_deref().unwrap_or(""),
+            %ip,
+            %request_id,
+            "HTTP request"
+        ),
+    }
     response
 }
 
+#[allow(dead_code)]
 fn short_id(value: &str) -> String {
     let value = value.replace(['\r', '\n'], "");
     let prefix = value.split('-').next().unwrap_or(&value);
@@ -63,6 +91,14 @@ fn short_id(value: &str) -> String {
 }
 
 fn log_path(path: &str) -> String {
+    if let Some(resource_path) = path.strip_prefix("/api/assets/music/")
+        && let Some((music_id, filename)) = resource_path.split_once('/')
+        && Uuid::parse_str(music_id).is_ok()
+        && !filename.is_empty()
+    {
+        return format!("/api/assets/music/**/{filename}");
+    }
+
     let Some(filename) = path.strip_prefix("/api/assets/avatar/") else {
         return path.to_owned();
     };
@@ -95,11 +131,27 @@ mod tests {
     }
 
     #[test]
+    fn replaces_music_uuid_in_log_path() {
+        assert_eq!(
+            log_path("/api/assets/music/5ec5d7bd-196a-43cf-b58f-d17e976bade5/cover.webp"),
+            "/api/assets/music/**/cover.webp"
+        );
+        assert_eq!(
+            log_path("/api/assets/music/5ec5d7bd-196a-43cf-b58f-d17e976bade5/audio.m4a"),
+            "/api/assets/music/**/audio.m4a"
+        );
+    }
+
+    #[test]
     fn leaves_other_paths_unchanged() {
         assert_eq!(log_path("/api/users"), "/api/users");
         assert_eq!(
             log_path("/api/assets/avatar/avatar-shville.webp"),
             "/api/assets/avatar/avatar-shville.webp"
+        );
+        assert_eq!(
+            log_path("/api/assets/music/not-a-uuid/cover.webp"),
+            "/api/assets/music/not-a-uuid/cover.webp"
         );
     }
 }

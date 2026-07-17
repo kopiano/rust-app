@@ -2,7 +2,7 @@ use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
 use tokio::sync::broadcast;
 
-use crate::models::message::MessageBroadcast;
+use crate::models::{message::MessageBroadcast, music::MusicProcessingBroadcast};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,4 +16,5 @@ pub struct AppState {
     pub github_client_secret: String,
     pub github_redirect_uri: String,
     pub message_tx: broadcast::Sender<MessageBroadcast>,
+    pub music_tx: broadcast::Sender<MusicProcessingBroadcast>,
 }

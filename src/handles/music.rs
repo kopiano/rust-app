@@ -3,12 +3,18 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
+    time::Instant,
 };
 
 use axum::{
     Extension, Json,
-    extract::{Multipart, Path as AxumPath, State, multipart::Field},
+    extract::{
+        Multipart, Path as AxumPath, State, WebSocketUpgrade,
+        multipart::Field,
+        ws::{Message as WsMessage, WebSocket},
+    },
     http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 use serde::Deserialize;
@@ -19,7 +25,9 @@ use crate::{
     app::AppState,
     common::response::ApiResponse,
     middleware::jwt::Claims,
-    models::music::{Music, MusicFavoriteState, UpdateMusicFavorite},
+    models::music::{
+        Music, MusicFavoriteState, MusicListItem, MusicProcessingBroadcast, UpdateMusicFavorite,
+    },
 };
 
 const MUSIC_DIRECTORY: &str = "src/assets/music";
@@ -62,33 +70,78 @@ struct AudioMetadata {
     sample_rate: i32,
 }
 
-struct PreparedMusic {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverOutcome {
+    Embedded,
+    Fallback,
+}
+
+#[derive(Clone)]
+struct MusicUpload {
     id: Uuid,
     directory: PathBuf,
     title: String,
-    artist: String,
-    album: String,
-    duration_ms: i64,
-    bitrate: i32,
-    sample_rate: i32,
-    cover_url: String,
-    audio_url: String,
     original_url: String,
     original_format: String,
-    size: i64,
     original_size: i64,
+}
+
+pub async fn public_list(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<Vec<MusicListItem>>>, StatusCode> {
+    let music = sqlx::query_as::<_, MusicListItem>(
+        r#"
+        SELECT id, title, artist, album, cover_url, is_favorite,
+               processing_status, processing_error, created_at
+        FROM music
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "Failed to list public music");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(ApiResponse::success(music)))
+}
+
+pub async fn public_get(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<ApiResponse<Music>>, StatusCode> {
+    let music = sqlx::query_as::<_, Music>(
+        r#"
+        SELECT id, title, artist, album, duration_ms, bitrate, sample_rate,
+               cover_url, audio_url, original_url, format, original_format,
+               size, original_size, is_favorite, processing_status,
+               processing_error, created_at, updated_at
+        FROM music
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, music_id = %id, "Failed to get public music");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ApiResponse::success(music)))
 }
 
 pub async fn list(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<ApiResponse<Vec<Music>>>, StatusCode> {
+) -> Result<Json<ApiResponse<Vec<MusicListItem>>>, StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let music = sqlx::query_as::<_, Music>(
+    let music = sqlx::query_as::<_, MusicListItem>(
         r#"
-        SELECT id, title, artist, album, duration_ms, bitrate, sample_rate,
-               cover_url, audio_url, original_url, format, original_format,
-               size, original_size, is_favorite, created_at, updated_at
+        SELECT id, title, artist, album, cover_url, is_favorite,
+               processing_status, processing_error, created_at
         FROM music
         WHERE user_id = $1
         ORDER BY created_at DESC, id DESC
@@ -105,20 +158,102 @@ pub async fn list(
     Ok(Json(ApiResponse::success(music)))
 }
 
+pub async fn websocket(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let user_id = match authenticated_user_id(&claims) {
+        Ok(user_id) => user_id,
+        Err(status) => return status.into_response(),
+    };
+
+    upgrade
+        .on_upgrade(move |socket| music_websocket_session(socket, state, user_id))
+        .into_response()
+}
+
+async fn music_websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid) {
+    let mut events = state.music_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                match event {
+                    Ok(event) if event.user_id == user_id => {
+                        let payload = match serde_json::to_string(&event) {
+                            Ok(payload) => payload,
+                            Err(_) => continue,
+                        };
+                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(WsMessage::Close(_))) | None => break,
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Text(_)))
+                    | Some(Ok(WsMessage::Pong(_)))
+                    | Some(Ok(WsMessage::Binary(_))) => {}
+                    Some(Err(_)) => break,
+                }
+            }
+        }
+    }
+}
+
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<ApiResponse<Music>>, StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    let music = sqlx::query_as::<_, Music>(
+        r#"
+        SELECT id, title, artist, album, duration_ms, bitrate, sample_rate,
+               cover_url, audio_url, original_url, format, original_format,
+               size, original_size, is_favorite, processing_status,
+               processing_error, created_at, updated_at
+        FROM music
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %user_id, music_id = %id, "Failed to get music");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    Ok(Json(ApiResponse::success(music)))
+}
+
 pub async fn upload(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ApiResponse<Vec<Music>>>), StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let mut prepared_music = Vec::new();
+    let mut uploads = Vec::new();
     let mut found_file = false;
 
     loop {
         let next_field = match multipart.next_field().await {
             Ok(field) => field,
             Err(_) => {
-                cleanup_prepared_music(&prepared_music).await;
+                cleanup_uploads(&uploads).await;
                 return Err(StatusCode::BAD_REQUEST);
             }
         };
@@ -130,16 +265,16 @@ pub async fn upload(
         }
         found_file = true;
 
-        match prepare_music(&mut field).await {
-            Ok(prepared) => prepared_music.push(prepared),
+        match prepare_upload(&mut field).await {
+            Ok(upload) => uploads.push(upload),
             Err(status) => {
-                cleanup_prepared_music(&prepared_music).await;
+                cleanup_uploads(&uploads).await;
                 return Err(status);
             }
         }
     }
 
-    if !found_file || prepared_music.is_empty() {
+    if !found_file || uploads.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -147,26 +282,29 @@ pub async fn upload(
         Ok(transaction) => transaction,
         Err(error) => {
             tracing::error!(%error, %user_id, "Failed to begin music upload transaction");
-            cleanup_prepared_music(&prepared_music).await;
+            cleanup_uploads(&uploads).await;
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
-    let mut created = Vec::with_capacity(prepared_music.len());
-    for prepared in &prepared_music {
-        let inserted = insert_music(&mut transaction, user_id, prepared).await;
-        match inserted {
+    let mut created = Vec::with_capacity(uploads.len());
+    for upload in &uploads {
+        match insert_processing_music(&mut transaction, user_id, upload).await {
             Ok(music) => created.push(music),
             Err(status) => {
                 let _ = transaction.rollback().await;
-                cleanup_prepared_music(&prepared_music).await;
+                cleanup_uploads(&uploads).await;
                 return Err(status);
             }
         }
     }
     if let Err(error) = transaction.commit().await {
         tracing::error!(%error, %user_id, "Failed to commit music upload transaction");
-        cleanup_prepared_music(&prepared_music).await;
+        cleanup_uploads(&uploads).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    for upload in uploads {
+        spawn_music_processing(state.db.clone(), state.music_tx.clone(), user_id, upload);
     }
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(created))))
@@ -201,6 +339,49 @@ pub async fn favorite(
     Ok(Json(ApiResponse::success(state)))
 }
 
+pub async fn delete(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Result<Json<ApiResponse<()>>, StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    let deleted_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        DELETE FROM music
+        WHERE id = $1 AND user_id = $2
+        RETURNING id
+        "#,
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %user_id, music_id = %id, "Failed to delete music");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+    .ok_or(StatusCode::NOT_FOUND)?;
+
+    let directory = PathBuf::from(MUSIC_DIRECTORY).join(deleted_id.to_string());
+    match tokio::fs::remove_dir_all(&directory).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                %user_id,
+                music_id = %deleted_id,
+                path = %directory.display(),
+                "Music database row was deleted but local files could not be removed"
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    tracing::info!(%user_id, music_id = %deleted_id, "Music and local files deleted");
+    Ok(Json(ApiResponse::success(())))
+}
+
 fn authenticated_user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
     claims
         .sub
@@ -208,7 +389,7 @@ fn authenticated_user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-async fn prepare_music(field: &mut Field<'_>) -> Result<PreparedMusic, StatusCode> {
+async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, StatusCode> {
     let original_name = field
         .file_name()
         .map(str::to_owned)
@@ -225,102 +406,62 @@ async fn prepare_music(field: &mut Field<'_>) -> Result<PreparedMusic, StatusCod
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    let result = prepare_music_files(
-        field,
-        &original_name,
-        &original_format,
-        id,
-        directory.clone(),
-    )
+    let result = async {
+        let original_path = directory.join(format!("original.{original_format}"));
+        let original_size = save_audio_field(field, &original_path).await?;
+        let fallback_title = filename_title(&original_name);
+
+        let base_url = format!("/api/assets/music/{id}");
+        let original_url = format!("{base_url}/original.{original_format}");
+        Ok(MusicUpload {
+            id,
+            directory: directory.clone(),
+            title: fallback_title,
+            original_url,
+            original_format,
+            original_size,
+        })
+    }
     .await;
+
     if result.is_err() {
         cleanup_directory(&directory).await;
     }
     result
 }
 
-async fn prepare_music_files(
-    field: &mut Field<'_>,
-    original_name: &str,
-    original_format: &str,
-    id: Uuid,
-    directory: PathBuf,
-) -> Result<PreparedMusic, StatusCode> {
-    let original_path = directory.join(format!("original.{original_format}"));
-    let original_size = save_audio_field(field, &original_path).await?;
-    let original_probe = probe_audio(&original_path).await?;
-    let fallback_title = filename_title(original_name);
-    let original_metadata = metadata_from_probe(&original_probe, &fallback_title);
-
-    let audio_path = directory.join("audio.m4a");
-    transcode_to_aac(&original_path, &audio_path).await?;
-    let output_probe = probe_audio(&audio_path).await?;
-    let output_metadata = metadata_from_probe(&output_probe, &original_metadata.title);
-    let output_size = file_size(&audio_path).await?;
-
-    let cover_path = directory.join("cover.webp");
-    create_cover(&original_path, &cover_path, id).await?;
-
-    let base_url = format!("/api/assets/music/{id}");
-    Ok(PreparedMusic {
-        id,
-        directory,
-        title: preferred_text(&original_metadata.title, &fallback_title),
-        artist: preferred_text(&original_metadata.artist, "Unknown Artist"),
-        album: preferred_text(&original_metadata.album, "Unknown Album"),
-        duration_ms: output_metadata
-            .duration_ms
-            .max(original_metadata.duration_ms),
-        bitrate: output_metadata.bitrate,
-        sample_rate: output_metadata.sample_rate,
-        cover_url: format!("{base_url}/cover.webp"),
-        audio_url: format!("{base_url}/audio.m4a"),
-        original_url: format!("{base_url}/original.{original_format}"),
-        original_format: original_format.to_owned(),
-        size: output_size,
-        original_size,
-    })
-}
-
-async fn insert_music(
+async fn insert_processing_music(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: Uuid,
-    music: &PreparedMusic,
+    music: &MusicUpload,
 ) -> Result<Music, StatusCode> {
     sqlx::query_as::<_, Music>(
         r#"
         INSERT INTO music (
             id, user_id, title, artist, album, duration_ms, bitrate,
             sample_rate, cover_url, audio_url, original_url, format,
-            original_format, size, original_size
+            original_format, size, original_size, processing_status
         )
         VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-            'm4a', $12, $13, $14
+            $1, $2, $3, 'Unknown Artist', 'Unknown Album', 0, 0, 0,
+            '', '', $4, $5, $5, 0, $6, 'processing'
         )
         RETURNING id, title, artist, album, duration_ms, bitrate, sample_rate,
                   cover_url, audio_url, original_url, format, original_format,
-                  size, original_size, is_favorite, created_at, updated_at
+                  size, original_size, is_favorite, processing_status,
+                  processing_error, created_at, updated_at
         "#,
     )
     .bind(music.id)
     .bind(user_id)
     .bind(&music.title)
-    .bind(&music.artist)
-    .bind(&music.album)
-    .bind(music.duration_ms)
-    .bind(music.bitrate)
-    .bind(music.sample_rate)
-    .bind(&music.cover_url)
-    .bind(&music.audio_url)
     .bind(&music.original_url)
     .bind(&music.original_format)
-    .bind(music.size)
     .bind(music.original_size)
     .fetch_one(&mut **transaction)
     .await
     .map_err(|error| {
-        tracing::error!(%error, %user_id, music_id = %music.id, "Failed to save music metadata");
+        tracing::error!(%error, %user_id, music_id = %music.id, "Failed to save processing music");
         StatusCode::INTERNAL_SERVER_ERROR
     })
 }
@@ -429,7 +570,67 @@ async fn transcode_to_aac(source: &Path, output: &Path) -> Result<(), StatusCode
     Ok(())
 }
 
-async fn create_cover(source: &Path, output: &Path, id: Uuid) -> Result<(), StatusCode> {
+async fn has_embedded_cover(source: &Path) -> Result<bool, StatusCode> {
+    let ffprobe = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_owned());
+    let result = Command::new(&ffprobe)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=index",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(source)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, executable = %ffprobe, "Failed to inspect embedded music cover");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    if !result.status.success() {
+        tracing::warn!(
+            source = %source.display(),
+            stderr = %String::from_utf8_lossy(&result.stderr),
+            "FFprobe failed while inspecting embedded music cover"
+        );
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    Ok(!result.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+async fn create_cover(source: &Path, output: &Path, id: Uuid) -> Result<CoverOutcome, StatusCode> {
+    let has_embedded_cover = has_embedded_cover(source).await?;
+    if !has_embedded_cover {
+        let id_bytes = *id.as_bytes();
+        let encoded = tokio::task::spawn_blocking(move || encode_cover(None, id_bytes))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "Fallback cover encoding task failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|error| {
+                tracing::error!(%error, "Failed to encode fallback WebP cover");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        tokio::fs::write(output, encoded).await.map_err(|error| {
+            tracing::error!(%error, path = %output.display(), "Failed to save fallback WebP cover");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        tracing::info!(
+            music_id = %id,
+            source = %source.display(),
+            "Music has no embedded artwork; generated fallback cover"
+        );
+        return Ok(CoverOutcome::Fallback);
+    }
+
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
     let extracted = Command::new(&ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-i"])
@@ -446,30 +647,270 @@ async fn create_cover(source: &Path, output: &Path, id: Uuid) -> Result<(), Stat
             "png",
             "pipe:1",
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .output()
-        .await;
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, executable = %ffmpeg, music_id = %id, "Failed to extract embedded music cover");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    let extracted_bytes = extracted
-        .ok()
-        .filter(|result| result.status.success() && !result.stdout.is_empty())
-        .map(|result| result.stdout);
-    let id_bytes = *id.as_bytes();
+    if !extracted.status.success() || extracted.stdout.is_empty() {
+        tracing::error!(
+            music_id = %id,
+            source = %source.display(),
+            status = ?extracted.status.code(),
+            stderr = %String::from_utf8_lossy(&extracted.stderr),
+            "Embedded music cover extraction failed"
+        );
+        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let extracted_bytes = extracted.stdout;
     let encoded =
-        tokio::task::spawn_blocking(move || encode_cover(extracted_bytes.as_deref(), id_bytes))
+        tokio::task::spawn_blocking(move || encode_cover(Some(&extracted_bytes), [0; 16]))
             .await
             .map_err(|error| {
-                tracing::error!(%error, "Cover encoding task failed");
+                tracing::error!(%error, music_id = %id, "Cover encoding task failed");
                 StatusCode::INTERNAL_SERVER_ERROR
             })?
             .map_err(|error| {
-                tracing::error!(%error, "Failed to encode WebP cover");
-                StatusCode::INTERNAL_SERVER_ERROR
+                tracing::error!(%error, music_id = %id, "Failed to encode embedded WebP cover");
+                StatusCode::UNPROCESSABLE_ENTITY
             })?;
 
     tokio::fs::write(output, encoded).await.map_err(|error| {
         tracing::error!(%error, path = %output.display(), "Failed to save WebP cover");
         StatusCode::INTERNAL_SERVER_ERROR
-    })
+    })?;
+    Ok(CoverOutcome::Embedded)
+}
+
+fn spawn_music_processing(
+    db: sqlx::PgPool,
+    music_tx: tokio::sync::broadcast::Sender<MusicProcessingBroadcast>,
+    user_id: Uuid,
+    music: MusicUpload,
+) {
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        let original_path = music
+            .directory
+            .join(format!("original.{}", music.original_format));
+        let audio_path = music.directory.join("audio.m4a");
+        let cover_path = music.directory.join("cover-processed.webp");
+        let (source_probe_result, transcode_result, cover_result) = tokio::join!(
+            probe_audio(&original_path),
+            transcode_to_aac(&original_path, &audio_path),
+            create_cover(&original_path, &cover_path, music.id),
+        );
+
+        let source_probe = match source_probe_result {
+            Ok(probe) => probe,
+            Err(status) => {
+                tracing::error!(music_id = %music.id, %status, "Failed to probe uploaded music");
+                mark_music_processing_failed(
+                    &db,
+                    &music_tx,
+                    user_id,
+                    music.id,
+                    "Unsupported or invalid audio file",
+                )
+                .await;
+                return;
+            }
+        };
+        let (cover_ready, preserve_original) = match cover_result {
+            Ok(outcome) => {
+                tracing::info!(music_id = %music.id, ?outcome, "Music cover processing completed");
+                (true, false)
+            }
+            Err(status) => {
+                tracing::warn!(
+                    music_id = %music.id,
+                    %status,
+                    "Music cover processing failed; preserving original audio for retry"
+                );
+                (false, true)
+            }
+        };
+        if let Err(status) = transcode_result {
+            tracing::error!(music_id = %music.id, %status, "Background music transcoding failed");
+            mark_music_processing_failed(
+                &db,
+                &music_tx,
+                user_id,
+                music.id,
+                "Audio transcoding failed",
+            )
+            .await;
+            return;
+        }
+
+        let output_probe = match probe_audio(&audio_path).await {
+            Ok(probe) => probe,
+            Err(status) => {
+                tracing::error!(music_id = %music.id, %status, "Failed to probe transcoded music");
+                mark_music_processing_failed(
+                    &db,
+                    &music_tx,
+                    user_id,
+                    music.id,
+                    "Transcoded audio validation failed",
+                )
+                .await;
+                return;
+            }
+        };
+        let source_metadata = metadata_from_probe(&source_probe, &music.title);
+        let output_metadata = metadata_from_probe(&output_probe, &source_metadata.title);
+        let output_size = match file_size(&audio_path).await {
+            Ok(size) => size,
+            Err(status) => {
+                tracing::error!(music_id = %music.id, %status, "Failed to read transcoded music size");
+                mark_music_processing_failed(
+                    &db,
+                    &music_tx,
+                    user_id,
+                    music.id,
+                    "Failed to read processed audio",
+                )
+                .await;
+                return;
+            }
+        };
+
+        match sqlx::query_as::<_, Music>(
+            r#"
+            UPDATE music
+            SET title = $2,
+                artist = $3,
+                album = $4,
+                duration_ms = $5,
+                bitrate = $6,
+                sample_rate = $7,
+                audio_url = $8,
+                original_url = $8,
+                format = 'm4a',
+                original_format = 'm4a',
+                size = $9,
+                original_size = $9,
+                cover_url = CASE WHEN $10 THEN $11 ELSE cover_url END,
+                processing_status = 'ready',
+                processing_error = NULL,
+                updated_at = NOW()
+            WHERE id = $1 AND user_id = $12
+            RETURNING id, title, artist, album, duration_ms, bitrate, sample_rate,
+                      cover_url, audio_url, original_url, format, original_format,
+                      size, original_size, is_favorite, processing_status,
+                      processing_error, created_at, updated_at
+            "#,
+        )
+        .bind(music.id)
+        .bind(preferred_text(&source_metadata.title, &music.title))
+        .bind(preferred_text(&source_metadata.artist, "Unknown Artist"))
+        .bind(preferred_text(&source_metadata.album, "Unknown Album"))
+        .bind(output_metadata.duration_ms.max(source_metadata.duration_ms))
+        .bind(output_metadata.bitrate)
+        .bind(output_metadata.sample_rate)
+        .bind(format!("/api/assets/music/{}/audio.m4a", music.id))
+        .bind(output_size)
+        .bind(cover_ready)
+        .bind(format!(
+            "/api/assets/music/{}/cover-processed.webp",
+            music.id
+        ))
+        .bind(user_id)
+        .fetch_optional(&db)
+        .await
+        {
+            Ok(None) => {
+                tracing::warn!(music_id = %music.id, "Transcoded music no longer has a database row");
+            }
+            Ok(Some(published)) => {
+                if !preserve_original {
+                    if let Err(error) = tokio::fs::remove_file(&original_path).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(
+                            %error,
+                            music_id = %music.id,
+                            path = %original_path.display(),
+                            "Failed to remove original music after publishing AAC"
+                        );
+                    }
+                }
+                tracing::info!(
+                    music_id = %music.id,
+                    elapsed_ms = started_at.elapsed().as_millis(),
+                    "Background music processing completed"
+                );
+                publish_music_processing_event(&music_tx, user_id, published);
+            }
+            Err(error) => {
+                tracing::error!(%error, music_id = %music.id, "Failed to publish transcoded music");
+                mark_music_processing_failed(
+                    &db,
+                    &music_tx,
+                    user_id,
+                    music.id,
+                    "Failed to publish processed audio",
+                )
+                .await;
+            }
+        }
+    });
+}
+
+async fn mark_music_processing_failed(
+    db: &sqlx::PgPool,
+    music_tx: &tokio::sync::broadcast::Sender<MusicProcessingBroadcast>,
+    user_id: Uuid,
+    id: Uuid,
+    message: &str,
+) {
+    match sqlx::query_as::<_, Music>(
+        r#"
+        UPDATE music
+        SET processing_status = 'failed',
+            processing_error = $2,
+            updated_at = NOW()
+        WHERE id = $1 AND user_id = $3
+        RETURNING id, title, artist, album, duration_ms, bitrate, sample_rate,
+                  cover_url, audio_url, original_url, format, original_format,
+                  size, original_size, is_favorite, processing_status,
+                  processing_error, created_at, updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(message)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    {
+        Ok(Some(music)) => publish_music_processing_event(music_tx, user_id, music),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%error, music_id = %id, "Failed to mark music processing as failed");
+        }
+    }
+}
+
+fn publish_music_processing_event(
+    music_tx: &tokio::sync::broadcast::Sender<MusicProcessingBroadcast>,
+    user_id: Uuid,
+    music: Music,
+) {
+    let event = MusicProcessingBroadcast {
+        user_id,
+        event: "music.processing",
+        id: music.id,
+        status: music.processing_status.clone(),
+        audio_url: music.audio_url.clone(),
+        music,
+    };
+    let _ = music_tx.send(event);
 }
 
 fn encode_cover(bytes: Option<&[u8]>, seed: [u8; 16]) -> image::ImageResult<Vec<u8>> {
@@ -621,8 +1062,8 @@ async fn cleanup_directory(path: &Path) {
     }
 }
 
-async fn cleanup_prepared_music(music: &[PreparedMusic]) {
-    for item in music {
+async fn cleanup_uploads(uploads: &[MusicUpload]) {
+    for item in uploads {
         cleanup_directory(&item.directory).await;
     }
 }
@@ -630,10 +1071,10 @@ async fn cleanup_prepared_music(music: &[PreparedMusic]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProbeFormat, ProbeOutput, ProbeStream, audio_extension, create_cover, encode_cover,
-        filename_title, metadata_from_probe, probe_audio, transcode_to_aac,
+        CoverOutcome, ProbeFormat, ProbeOutput, ProbeStream, audio_extension, create_cover,
+        encode_cover, filename_title, metadata_from_probe, probe_audio, transcode_to_aac,
     };
-    use image::ImageFormat;
+    use image::{ImageBuffer, ImageFormat, Rgb};
     use std::{collections::HashMap, process::Stdio};
     use tokio::process::Command;
     use uuid::Uuid;
@@ -718,12 +1159,70 @@ mod tests {
         assert!(generated.success());
 
         transcode_to_aac(&source, &audio).await.unwrap();
-        create_cover(&source, &cover, Uuid::new_v4()).await.unwrap();
+        let outcome = create_cover(&source, &cover, Uuid::new_v4()).await.unwrap();
+        assert_eq!(outcome, CoverOutcome::Fallback);
         let probe = probe_audio(&audio).await.unwrap();
         let metadata = metadata_from_probe(&probe, "fallback");
         assert!(metadata.duration_ms >= 900);
         assert!(metadata.bitrate > 0);
         assert!(metadata.sample_rate > 0);
+        assert_eq!(
+            image::guess_format(&tokio::fs::read(&cover).await.unwrap()).unwrap(),
+            ImageFormat::WebP
+        );
+
+        tokio::fs::remove_dir_all(directory).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extracts_an_embedded_cover_instead_of_using_fallback() {
+        let directory = std::env::temp_dir().join(format!("rust-app-cover-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let artwork = directory.join("artwork.png");
+        let source = directory.join("source.mp3");
+        let cover = directory.join("cover.webp");
+        ImageBuffer::from_pixel(64, 64, Rgb([220_u8, 24, 80]))
+            .save(&artwork)
+            .unwrap();
+
+        let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
+        let generated = Command::new(ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-i",
+            ])
+            .arg(&artwork)
+            .args([
+                "-map",
+                "0:a:0",
+                "-map",
+                "1:v:0",
+                "-c:a",
+                "libmp3lame",
+                "-c:v",
+                "png",
+                "-disposition:v:0",
+                "attached_pic",
+                "-id3v2_version",
+                "3",
+            ])
+            .arg(&source)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .unwrap();
+        assert!(generated.success());
+
+        let outcome = create_cover(&source, &cover, Uuid::new_v4()).await.unwrap();
+        assert_eq!(outcome, CoverOutcome::Embedded);
         assert_eq!(
             image::guess_format(&tokio::fs::read(&cover).await.unwrap()).unwrap(),
             ImageFormat::WebP

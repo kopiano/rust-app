@@ -20,8 +20,34 @@ pub struct Music {
     pub size: i64,
     pub original_size: i64,
     pub is_favorite: bool,
+    pub processing_status: String,
+    pub processing_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct MusicListItem {
+    pub id: Uuid,
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub cover_url: String,
+    pub is_favorite: bool,
+    pub processing_status: String,
+    pub processing_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MusicProcessingBroadcast {
+    #[serde(skip)]
+    pub user_id: Uuid,
+    pub event: &'static str,
+    pub id: Uuid,
+    pub status: String,
+    pub audio_url: String,
+    pub music: Music,
 }
 
 #[derive(Debug, Deserialize)]

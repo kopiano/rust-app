@@ -11,17 +11,24 @@ use crate::database::{postgres, redis};
 
 #[tokio::main]
 async fn main() {
-    // logger
-    logger::init_tracing();
     // .env
     dotenvy::dotenv().ok();
+    // logger
+    logger::init_tracing();
+    tracing::info!(target: "app::server", "Server started");
     // jwt
     let jwt = jwt::JwtConfig::from_env();
     // postgresql, redis
     let pool = postgres::connect().await;
-    sqlx::migrate!("./migrations").run(&pool).await.expect("Database migration failed");
+    tracing::info!(target: "app::db", "PostgreSQL connected");
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("Database migration failed");
     let redis = redis::connect().await;
+    tracing::info!(target: "app::redis", "Redis connected");
     let (message_tx, _) = tokio::sync::broadcast::channel(256);
+    let (music_tx, _) = tokio::sync::broadcast::channel(256);
     // state
     let state = app::AppState {
         db: pool,
@@ -36,6 +43,7 @@ async fn main() {
         github_redirect_uri: std::env::var("GITHUB_REDIRECT_URI")
             .unwrap_or_else(|_| "http://localhost:8100/api/auth/github/callback".to_string()),
         message_tx,
+        music_tx,
     };
 
     // router
@@ -45,7 +53,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .unwrap();
-    tracing::info!("Server is running on http://localhost:{port}");
+    tracing::info!(target: "app::http", address = %format!("0.0.0.0:{port}"), "Listening");
     // run axum web server
     axum::serve(listener, app).await.unwrap();
 }

@@ -135,6 +135,8 @@ src/
 git restore --staged .
 ```
 
+
+
 ## 接口性能优化
 ### login
 * bcrypt校验耗时严重，降低cost。
@@ -147,5 +149,35 @@ let is_valid = tokio::task::spawn_blocking(move || {
     bcrypt::verify(password, &hash)
 })
 .await??;
+```
+
+
+## 日志
+库：tracing
+输出格式：
+* 终端控制台：一行彩色
+* 日志文件：json，便于按字段筛选
+
+
+终端控制台输出格式：
+  * 彩色、单行文本日志（便于终端阅读）
+  * 固定列宽，左对齐，只有耗时和状态码右对齐
+  * path缩写，user_id缩写，sql语句缩写，其它太长也缩写，不要把其他字段挤出其位置
+  * 日志级别：INFO绿色，warn橙色，Error红色。
+  * 状态：OK或200绿色，4开头红色，5开头橙色
+  * 耗时：>100 ms橙色，>1000 ms红色，耗时预留5位数字的位置
+  * 日志的path如果太长要省略一些不重要的内容用*表示，比如user_id只显示9b9fd548-***这样子
+```sh
+2026-07-17 21:45:18  INFO     app::server   > Server started
+2026-07-17 21:45:18  INFO     app::db       > PostgreSQL connected
+2026-07-17 21:45:18  INFO     app::redis    > Redis connected
+2026-07-17 21:45:18  INFO     app::http     > Listening on 0.0.0.0:8100
+2026-07-17 21:45:18  INFO     app::sql      > INSERT music                  OK        8 ms  rows=1
+2026-07-17 21:45:18  INFO     app::ws       > CONNECT                       OK        1 ms  user=1001
+2026-07-17 21:45:18  INFO     app::ffmpeg   > CONNECT                       OK     3284 ms  music=105        AAC 128kbps
+2026-07-16 18:45:37  INFO     GET           /api/music                     200       0 ms
+2026-07-16 18:31:16  INFO     POST          /api/music/upload              201      91 ms   user_id=1001     Upload success (id=105)
+2026-07-16 18:32:12  Warn     POST          /api/login                     401      18 ms   user_id=1001
+2026-07-16 18:34:29  Error    GET           /api/music                     500       2 ms                    Database timeout
 ```
 
