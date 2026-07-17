@@ -5,6 +5,7 @@ mod database;
 mod handles;
 mod middleware;
 mod models;
+mod services;
 
 use crate::config::{jwt, logger};
 use crate::database::{postgres, redis};

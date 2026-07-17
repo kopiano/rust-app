@@ -3,6 +3,7 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
     time::Instant,
 };
 
@@ -17,7 +18,8 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::{io::AsyncWriteExt, process::Command, sync::Semaphore};
 use uuid::Uuid;
 
@@ -28,12 +30,13 @@ use crate::{
     models::music::{
         Music, MusicFavoriteState, MusicListItem, MusicProcessingBroadcast, UpdateMusicFavorite,
     },
+    services::ncm::{self, DecryptedNcm},
 };
 
 const MUSIC_DIRECTORY: &str = "src/assets/music";
 const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 const AAC_BITRATE: &str = "256k";
-const ALLOWED_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus"];
+const ALLOWED_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "ncm"];
 static AUDIO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +64,7 @@ struct ProbeFormat {
     tags: HashMap<String, String>,
 }
 
+#[derive(Clone)]
 struct AudioMetadata {
     title: String,
     artist: String,
@@ -84,6 +88,44 @@ struct MusicUpload {
     original_url: String,
     original_format: String,
     original_size: i64,
+    file_hash: String,
+    source_metadata: AudioMetadata,
+    ncm: Option<Arc<DecryptedNcm>>,
+}
+
+struct ProcessingSource {
+    path: PathBuf,
+    ncm: Option<Arc<DecryptedNcm>>,
+}
+
+struct UploadPreparationError {
+    status: StatusCode,
+    message: &'static str,
+}
+
+struct SavedAudio {
+    size: i64,
+    hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+struct DuplicateMusicMatch {
+    id: Uuid,
+    title: String,
+    artist: String,
+    album: String,
+    duration_ms: i64,
+}
+
+#[derive(Serialize)]
+struct MusicDuplicateConflict {
+    kind: &'static str,
+    matches: Vec<DuplicateMusicMatch>,
+}
+
+enum InsertMusicError {
+    ExactDuplicate,
+    Internal,
 }
 
 pub async fn public_list(
@@ -210,7 +252,7 @@ async fn music_websocket_session(mut socket: WebSocket, state: AppState, user_id
         }
     }
 }
-
+#[allow(dead_code)]
 pub async fn get(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -244,22 +286,31 @@ pub async fn upload(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<ApiResponse<Vec<Music>>>), StatusCode> {
-    let user_id = authenticated_user_id(&claims)?;
+) -> Result<Response, Response> {
+    let user_id = authenticated_user_id(&claims).map_err(IntoResponse::into_response)?;
     let mut uploads = Vec::new();
     let mut found_file = false;
+    let mut allow_similar = false;
 
     loop {
         let next_field = match multipart.next_field().await {
             Ok(field) => field,
             Err(_) => {
                 cleanup_uploads(&uploads).await;
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into_response());
             }
         };
         let Some(mut field) = next_field else {
             break;
         };
+        if field.name() == Some("allow_similar") {
+            allow_similar = field
+                .text()
+                .await
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            continue;
+        }
         if field.name() != Some("files") {
             continue;
         }
@@ -269,13 +320,47 @@ pub async fn upload(
             Ok(upload) => uploads.push(upload),
             Err(status) => {
                 cleanup_uploads(&uploads).await;
-                return Err(status);
+                return Err(upload_error_response(status));
             }
         }
     }
 
     if !found_file || uploads.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+
+    match exact_duplicate_matches(&state.db, user_id, &uploads).await {
+        Ok(Some(matches)) => {
+            cleanup_uploads(&uploads).await;
+            return Err(duplicate_conflict_response(
+                "exact",
+                "该音乐已上传",
+                matches,
+            ));
+        }
+        Ok(None) => {}
+        Err(status) => {
+            cleanup_uploads(&uploads).await;
+            return Err(status.into_response());
+        }
+    }
+
+    if !allow_similar {
+        match similar_music_matches(&state.db, user_id, &uploads).await {
+            Ok(matches) if !matches.is_empty() => {
+                cleanup_uploads(&uploads).await;
+                return Err(duplicate_conflict_response(
+                    "similar",
+                    "检测到可能重复的音乐，是否继续上传？",
+                    matches,
+                ));
+            }
+            Ok(_) => {}
+            Err(status) => {
+                cleanup_uploads(&uploads).await;
+                return Err(status.into_response());
+            }
+        }
     }
 
     let mut transaction = match state.db.begin().await {
@@ -283,31 +368,40 @@ pub async fn upload(
         Err(error) => {
             tracing::error!(%error, %user_id, "Failed to begin music upload transaction");
             cleanup_uploads(&uploads).await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
         }
     };
     let mut created = Vec::with_capacity(uploads.len());
     for upload in &uploads {
         match insert_processing_music(&mut transaction, user_id, upload).await {
             Ok(music) => created.push(music),
-            Err(status) => {
+            Err(InsertMusicError::ExactDuplicate) => {
                 let _ = transaction.rollback().await;
                 cleanup_uploads(&uploads).await;
-                return Err(status);
+                return Err(duplicate_conflict_response(
+                    "exact",
+                    "该音乐已上传",
+                    Vec::new(),
+                ));
+            }
+            Err(InsertMusicError::Internal) => {
+                let _ = transaction.rollback().await;
+                cleanup_uploads(&uploads).await;
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
         }
     }
     if let Err(error) = transaction.commit().await {
         tracing::error!(%error, %user_id, "Failed to commit music upload transaction");
         cleanup_uploads(&uploads).await;
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
     for upload in uploads {
         spawn_music_processing(state.db.clone(), state.music_tx.clone(), user_id, upload);
     }
 
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(created))))
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(created))).into_response())
 }
 
 pub async fn favorite(
@@ -389,13 +483,19 @@ fn authenticated_user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, StatusCode> {
+async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, UploadPreparationError> {
     let original_name = field
         .file_name()
         .map(str::to_owned)
-        .ok_or(StatusCode::BAD_REQUEST)?;
+        .ok_or(UploadPreparationError {
+            status: StatusCode::BAD_REQUEST,
+            message: "Music file name is missing",
+        })?;
     let original_format = audio_extension(&original_name)
-        .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?
+        .ok_or(UploadPreparationError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "Unsupported music file format",
+        })?
         .to_owned();
     let id = Uuid::new_v4();
     let directory = PathBuf::from(MUSIC_DIRECTORY).join(id.to_string());
@@ -403,24 +503,49 @@ async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, StatusCode
         .await
         .map_err(|error| {
             tracing::error!(%error, path = %directory.display(), "Failed to create music directory");
-            StatusCode::INTERNAL_SERVER_ERROR
+            UploadPreparationError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: "Failed to prepare music upload",
+            }
         })?;
 
     let result = async {
         let original_path = directory.join(format!("original.{original_format}"));
-        let original_size = save_audio_field(field, &original_path).await?;
+        let saved = save_audio_field(field, &original_path)
+            .await
+            .map_err(upload_preparation_error)?;
         let fallback_title = filename_title(&original_name);
 
         let base_url = format!("/api/assets/music/{id}");
         let original_url = format!("{base_url}/original.{original_format}");
-        Ok(MusicUpload {
+        let mut upload = MusicUpload {
             id,
             directory: directory.clone(),
-            title: fallback_title,
+            title: fallback_title.clone(),
             original_url,
             original_format,
-            original_size,
-        })
+            original_size: saved.size,
+            file_hash: saved.hash,
+            source_metadata: AudioMetadata {
+                title: fallback_title.clone(),
+                artist: "Unknown Artist".to_owned(),
+                album: "Unknown Album".to_owned(),
+                duration_ms: 0,
+                bitrate: 0,
+                sample_rate: 0,
+            },
+            ncm: None,
+        };
+        prepare_ncm_upload(&mut upload, &original_path).await?;
+        let source = processing_source(&upload, &original_path);
+        let probe = probe_audio(&source.path)
+            .await
+            .map_err(|status| UploadPreparationError {
+                status,
+                message: "Unsupported or invalid audio file",
+            })?;
+        upload.source_metadata = source_metadata_for_upload(&upload, &probe);
+        Ok(upload)
     }
     .await;
 
@@ -430,21 +555,144 @@ async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, StatusCode
     result
 }
 
+fn upload_preparation_error(status: StatusCode) -> UploadPreparationError {
+    UploadPreparationError {
+        status,
+        message: "Failed to save music upload",
+    }
+}
+
+fn upload_error_response(error: UploadPreparationError) -> Response {
+    (
+        error.status,
+        Json(ApiResponse::<()>::error(
+            error.status.as_u16(),
+            error.message,
+        )),
+    )
+        .into_response()
+}
+
+fn duplicate_conflict_response(
+    kind: &'static str,
+    message: &'static str,
+    matches: Vec<DuplicateMusicMatch>,
+) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiResponse {
+            code: StatusCode::CONFLICT.as_u16(),
+            message: message.to_owned(),
+            data: Some(MusicDuplicateConflict { kind, matches }),
+        }),
+    )
+        .into_response()
+}
+
+async fn exact_duplicate_matches(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    uploads: &[MusicUpload],
+) -> Result<Option<Vec<DuplicateMusicMatch>>, StatusCode> {
+    let mut seen = std::collections::HashSet::new();
+    if uploads
+        .iter()
+        .any(|upload| !seen.insert(upload.file_hash.as_str()))
+    {
+        return Ok(Some(Vec::new()));
+    }
+
+    let hashes = uploads
+        .iter()
+        .map(|upload| upload.file_hash.clone())
+        .collect::<Vec<_>>();
+    let matches = sqlx::query_as::<_, DuplicateMusicMatch>(
+        r#"
+        SELECT id, title, artist, album, duration_ms
+        FROM music
+        WHERE user_id = $1 AND file_hash = ANY($2)
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(user_id)
+    .bind(hashes)
+    .fetch_all(db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %user_id, "Failed to check exact music duplicates");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok((!matches.is_empty()).then_some(matches))
+}
+
+async fn similar_music_matches(
+    db: &sqlx::PgPool,
+    user_id: Uuid,
+    uploads: &[MusicUpload],
+) -> Result<Vec<DuplicateMusicMatch>, StatusCode> {
+    let mut matches = Vec::new();
+    let mut matched_ids = std::collections::HashSet::new();
+
+    for upload in uploads {
+        let title = normalize_metadata_text(&upload.source_metadata.title);
+        let artist = normalize_metadata_text(&upload.source_metadata.artist);
+        if title.is_empty()
+            || artist.is_empty()
+            || artist == "unknown artist"
+            || upload.source_metadata.duration_ms <= 0
+        {
+            continue;
+        }
+
+        let candidates = sqlx::query_as::<_, DuplicateMusicMatch>(
+            r#"
+            SELECT id, title, artist, album, duration_ms
+            FROM music
+            WHERE user_id = $1
+              AND processing_status = 'ready'
+              AND regexp_replace(lower(trim(title)), '\s+', ' ', 'g') = $2
+              AND regexp_replace(lower(trim(artist)), '\s+', ' ', 'g') = $3
+              AND abs(duration_ms - $4) <= 3000
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(user_id)
+        .bind(&title)
+        .bind(&artist)
+        .bind(upload.source_metadata.duration_ms)
+        .fetch_all(db)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %user_id, music_id = %upload.id, "Failed to check similar music");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        for candidate in candidates {
+            if matched_ids.insert(candidate.id) {
+                matches.push(candidate);
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
 async fn insert_processing_music(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user_id: Uuid,
     music: &MusicUpload,
-) -> Result<Music, StatusCode> {
+) -> Result<Music, InsertMusicError> {
     sqlx::query_as::<_, Music>(
         r#"
         INSERT INTO music (
             id, user_id, title, artist, album, duration_ms, bitrate,
             sample_rate, cover_url, audio_url, original_url, format,
-            original_format, size, original_size, processing_status
+            original_format, size, original_size, processing_status, file_hash
         )
         VALUES (
-            $1, $2, $3, 'Unknown Artist', 'Unknown Album', 0, 0, 0,
-            '', '', $4, $5, $5, 0, $6, 'processing'
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            '', '', $9, $10, $10, 0, $11, 'processing', $12
         )
         RETURNING id, title, artist, album, duration_ms, bitrate, sample_rate,
                   cover_url, audio_url, original_url, format, original_format,
@@ -454,24 +702,36 @@ async fn insert_processing_music(
     )
     .bind(music.id)
     .bind(user_id)
-    .bind(&music.title)
+    .bind(&music.source_metadata.title)
+    .bind(&music.source_metadata.artist)
+    .bind(&music.source_metadata.album)
+    .bind(music.source_metadata.duration_ms)
+    .bind(music.source_metadata.bitrate)
+    .bind(music.source_metadata.sample_rate)
     .bind(&music.original_url)
     .bind(&music.original_format)
     .bind(music.original_size)
+    .bind(&music.file_hash)
     .fetch_one(&mut **transaction)
     .await
     .map_err(|error| {
+        if let sqlx::Error::Database(database_error) = &error
+            && database_error.constraint() == Some("music_user_file_hash_unique_idx")
+        {
+            return InsertMusicError::ExactDuplicate;
+        }
         tracing::error!(%error, %user_id, music_id = %music.id, "Failed to save processing music");
-        StatusCode::INTERNAL_SERVER_ERROR
+        InsertMusicError::Internal
     })
 }
 
-async fn save_audio_field(field: &mut Field<'_>, path: &Path) -> Result<i64, StatusCode> {
+async fn save_audio_field(field: &mut Field<'_>, path: &Path) -> Result<SavedAudio, StatusCode> {
     let mut file = tokio::fs::File::create(path).await.map_err(|error| {
         tracing::error!(%error, path = %path.display(), "Failed to create original audio");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
     let mut total = 0_u64;
+    let mut hasher = Sha256::new();
 
     while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
         total = total
@@ -480,6 +740,7 @@ async fn save_audio_field(field: &mut Field<'_>, path: &Path) -> Result<i64, Sta
         if total > MAX_AUDIO_BYTES {
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
         }
+        hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|error| {
             tracing::error!(%error, path = %path.display(), "Failed to write original audio");
             StatusCode::INTERNAL_SERVER_ERROR
@@ -492,7 +753,14 @@ async fn save_audio_field(field: &mut Field<'_>, path: &Path) -> Result<i64, Sta
     if total == 0 {
         return Err(StatusCode::BAD_REQUEST);
     }
-    i64::try_from(total).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)
+    Ok(SavedAudio {
+        size: i64::try_from(total).map_err(|_| StatusCode::PAYLOAD_TOO_LARGE)?,
+        hash: finalize_sha256(hasher),
+    })
+}
+
+fn finalize_sha256(hasher: Sha256) -> String {
+    format!("{:x}", hasher.finalize())
 }
 
 async fn probe_audio(path: &Path) -> Result<ProbeOutput, StatusCode> {
@@ -570,6 +838,99 @@ async fn transcode_to_aac(source: &Path, output: &Path) -> Result<(), StatusCode
     Ok(())
 }
 
+async fn prepare_ncm_upload(
+    music: &mut MusicUpload,
+    original_path: &Path,
+) -> Result<(), UploadPreparationError> {
+    let has_ncm_magic = ncm::is_ncm_file(original_path).await.map_err(|error| {
+        tracing::error!(
+            %error,
+            music_id = %music.id,
+            path = %original_path.display(),
+            "Failed to inspect uploaded music format"
+        );
+        UploadPreparationError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: "Failed to inspect uploaded music",
+        }
+    })?;
+    let declared_ncm = music.original_format.eq_ignore_ascii_case("ncm");
+    if !declared_ncm && !has_ncm_magic {
+        return Ok(());
+    }
+    if !has_ncm_magic {
+        tracing::warn!(
+            music_id = %music.id,
+            path = %original_path.display(),
+            "Uploaded file uses the NCM extension but has an invalid NCM header"
+        );
+        return Err(UploadPreparationError {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            message: "The uploaded NCM file has an invalid container header",
+        });
+    }
+
+    let decrypted = ncm::decrypt_ncm(original_path, &music.directory)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                %error,
+                music_id = %music.id,
+                path = %original_path.display(),
+                "Failed to decrypt uploaded NCM music"
+            );
+            UploadPreparationError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: "NCM decryption failed. Please verify the file and try again",
+            }
+        })?;
+    tracing::info!(
+        music_id = %music.id,
+        source = %original_path.display(),
+        decrypted_source = %decrypted.audio_path.display(),
+        "NCM music decrypted for background processing"
+    );
+
+    music.ncm = Some(Arc::new(decrypted));
+    Ok(())
+}
+
+fn processing_source(music: &MusicUpload, original_path: &Path) -> ProcessingSource {
+    match &music.ncm {
+        Some(decrypted) => ProcessingSource {
+            path: decrypted.audio_path.clone(),
+            ncm: Some(Arc::clone(decrypted)),
+        },
+        None => ProcessingSource {
+            path: original_path.to_owned(),
+            ncm: None,
+        },
+    }
+}
+
+fn source_metadata_for_upload(music: &MusicUpload, probe: &ProbeOutput) -> AudioMetadata {
+    let ncm_metadata = music.ncm.as_ref();
+    let fallback_title = ncm_metadata
+        .map(|source| preferred_text(&source.title, &music.title))
+        .unwrap_or_else(|| music.title.clone());
+    let probed = metadata_from_probe(probe, &fallback_title);
+
+    AudioMetadata {
+        title: ncm_metadata
+            .map(|source| preferred_text(&source.title, &probed.title))
+            .unwrap_or_else(|| preferred_text(&probed.title, &music.title)),
+        artist: ncm_metadata
+            .map(|source| preferred_text(&source.artist, &probed.artist))
+            .unwrap_or_else(|| preferred_text(&probed.artist, "Unknown Artist")),
+        album: ncm_metadata
+            .map(|source| preferred_text(&source.album, &probed.album))
+            .unwrap_or_else(|| preferred_text(&probed.album, "Unknown Album")),
+        duration_ms: probed.duration_ms,
+        bitrate: probed.bitrate,
+        sample_rate: probed.sample_rate,
+    }
+}
+
 async fn has_embedded_cover(source: &Path) -> Result<bool, StatusCode> {
     let ffprobe = std::env::var("FFPROBE_PATH").unwrap_or_else(|_| "ffprobe".to_owned());
     let result = Command::new(&ffprobe)
@@ -603,6 +964,59 @@ async fn has_embedded_cover(source: &Path) -> Result<bool, StatusCode> {
     }
 
     Ok(!result.stdout.iter().all(u8::is_ascii_whitespace))
+}
+
+async fn create_processing_cover(
+    source: &Path,
+    container_cover: Option<&Path>,
+    output: &Path,
+    id: Uuid,
+) -> Result<CoverOutcome, StatusCode> {
+    if let Some(container_cover) = container_cover {
+        match create_container_cover(container_cover, output, id).await {
+            Ok(()) => return Ok(CoverOutcome::Embedded),
+            Err(status) => {
+                tracing::warn!(
+                    music_id = %id,
+                    %status,
+                    "NCM embedded cover could not be used; falling back to generated artwork"
+                );
+            }
+        }
+    }
+
+    create_cover(source, output, id).await
+}
+
+async fn create_container_cover(
+    container_cover: &Path,
+    output: &Path,
+    id: Uuid,
+) -> Result<(), StatusCode> {
+    let cover_bytes = tokio::fs::read(container_cover).await.map_err(|error| {
+        tracing::warn!(
+            %error,
+            music_id = %id,
+            path = %container_cover.display(),
+            "Failed to read NCM embedded cover"
+        );
+        StatusCode::UNPROCESSABLE_ENTITY
+    })?;
+    let encoded =
+        tokio::task::spawn_blocking(move || encode_cover(Some(&cover_bytes), *id.as_bytes()))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, music_id = %id, "NCM cover encoding task failed");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .map_err(|error| {
+                tracing::warn!(%error, music_id = %id, "Failed to encode NCM embedded cover");
+                StatusCode::UNPROCESSABLE_ENTITY
+            })?;
+    tokio::fs::write(output, encoded).await.map_err(|error| {
+        tracing::error!(%error, path = %output.display(), "Failed to save NCM WebP cover");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 async fn create_cover(source: &Path, output: &Path, id: Uuid) -> Result<CoverOutcome, StatusCode> {
@@ -698,29 +1112,19 @@ fn spawn_music_processing(
         let original_path = music
             .directory
             .join(format!("original.{}", music.original_format));
+        let processing_source = processing_source(&music, &original_path);
+        let source_path = processing_source.path.clone();
+        let container_cover = processing_source
+            .ncm
+            .as_ref()
+            .and_then(|source| source.cover_path.as_deref());
         let audio_path = music.directory.join("audio.m4a");
         let cover_path = music.directory.join("cover-processed.webp");
-        let (source_probe_result, transcode_result, cover_result) = tokio::join!(
-            probe_audio(&original_path),
-            transcode_to_aac(&original_path, &audio_path),
-            create_cover(&original_path, &cover_path, music.id),
+        let (transcode_result, cover_result) = tokio::join!(
+            transcode_to_aac(&source_path, &audio_path),
+            create_processing_cover(&source_path, container_cover, &cover_path, music.id),
         );
 
-        let source_probe = match source_probe_result {
-            Ok(probe) => probe,
-            Err(status) => {
-                tracing::error!(music_id = %music.id, %status, "Failed to probe uploaded music");
-                mark_music_processing_failed(
-                    &db,
-                    &music_tx,
-                    user_id,
-                    music.id,
-                    "Unsupported or invalid audio file",
-                )
-                .await;
-                return;
-            }
-        };
         let (cover_ready, preserve_original) = match cover_result {
             Ok(outcome) => {
                 tracing::info!(music_id = %music.id, ?outcome, "Music cover processing completed");
@@ -763,7 +1167,7 @@ fn spawn_music_processing(
                 return;
             }
         };
-        let source_metadata = metadata_from_probe(&source_probe, &music.title);
+        let source_metadata = music.source_metadata.clone();
         let output_metadata = metadata_from_probe(&output_probe, &source_metadata.title);
         let output_size = match file_size(&audio_path).await {
             Ok(size) => size,
@@ -808,9 +1212,9 @@ fn spawn_music_processing(
             "#,
         )
         .bind(music.id)
-        .bind(preferred_text(&source_metadata.title, &music.title))
-        .bind(preferred_text(&source_metadata.artist, "Unknown Artist"))
-        .bind(preferred_text(&source_metadata.album, "Unknown Album"))
+        .bind(&source_metadata.title)
+        .bind(&source_metadata.artist)
+        .bind(&source_metadata.album)
         .bind(output_metadata.duration_ms.max(source_metadata.duration_ms))
         .bind(output_metadata.bitrate)
         .bind(output_metadata.sample_rate)
@@ -1046,6 +1450,14 @@ fn preferred_text(value: &str, fallback: &str) -> String {
     }
 }
 
+fn normalize_metadata_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 async fn file_size(path: &Path) -> Result<i64, StatusCode> {
     let size = tokio::fs::metadata(path)
         .await
@@ -1072,9 +1484,11 @@ async fn cleanup_uploads(uploads: &[MusicUpload]) {
 mod tests {
     use super::{
         CoverOutcome, ProbeFormat, ProbeOutput, ProbeStream, audio_extension, create_cover,
-        encode_cover, filename_title, metadata_from_probe, probe_audio, transcode_to_aac,
+        encode_cover, filename_title, finalize_sha256, metadata_from_probe,
+        normalize_metadata_text, probe_audio, transcode_to_aac,
     };
     use image::{ImageBuffer, ImageFormat, Rgb};
+    use sha2::{Digest, Sha256};
     use std::{collections::HashMap, process::Stdio};
     use tokio::process::Command;
     use uuid::Uuid;
@@ -1090,6 +1504,25 @@ mod tests {
     fn derives_a_readable_title_from_filename() {
         assert_eq!(filename_title("Morning Light.flac"), "Morning Light");
         assert_eq!(filename_title(".mp3"), "Untitled");
+    }
+
+    #[test]
+    fn normalizes_music_metadata_for_duplicate_checks() {
+        assert_eq!(normalize_metadata_text("  Night   DRIVE  "), "night drive");
+        assert_eq!(
+            normalize_metadata_text("Beyoncé Knowles"),
+            "beyoncé knowles"
+        );
+    }
+
+    #[test]
+    fn creates_a_stable_sha256_file_hash() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"same music bytes");
+        assert_eq!(
+            finalize_sha256(hasher),
+            "782f7041b6b48741a543909ad17b9c733a67db6233fcc56731d7c1a7cf54bef7"
+        );
     }
 
     #[test]
