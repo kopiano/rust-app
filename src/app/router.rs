@@ -1,6 +1,6 @@
 use crate::app::AppState;
-use crate::handles::{auth, message, moment, music, task, user};
-use crate::middleware::{cors, jwt, logger};
+use crate::handles::{auth, message, moment, music, subscription, task, user};
+use crate::middleware::{cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -21,6 +21,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(message_api(state.clone()))
         .merge(moment_api(state.clone()))
         .merge(music_api(state.clone()))
+        .merge(subscription_api(state.clone()))
         .merge(task_api(state.clone()));
 
     Router::new()
@@ -132,13 +133,34 @@ fn music_api(state: AppState) -> Router<AppState> {
             state.clone(),
             jwt::optional_auth,
         ));
-    let private = Router::new()
+    let library = Router::new()
         .route("/music", get(music::list))
         .route("/music/library", get(music::library))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            plan::require_library_access,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt::require_auth,
+        ));
+    let private = Router::new()
         .route("/music/upload", post(music::upload).layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES)))
         .route("/music/ws", get(music::websocket))
         .route("/music/{id}", axum::routing::delete(music::delete))
         .route("/music/{id}/favorite", put(music::favorite))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
-    Router::new().merge(public).merge(private)
+    Router::new().merge(public).merge(library).merge(private)
+}
+
+fn subscription_api(state: AppState) -> Router<AppState> {
+    let authenticated = Router::new()
+        .route(
+            "/subscription/pro/checkout",
+            post(subscription::create_pro_checkout),
+        )
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new()
+        .route("/subscription/webhook", post(subscription::webhook))
+        .merge(authenticated)
 }

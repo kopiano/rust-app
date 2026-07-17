@@ -43,6 +43,12 @@ async fn main() {
             .expect("GITHUB_CLIENT_SECRET not found"),
         github_redirect_uri: std::env::var("GITHUB_REDIRECT_URI")
             .unwrap_or_else(|_| "http://localhost:8100/api/auth/github/callback".to_string()),
+        pro_checkout_url: std::env::var("PRO_CHECKOUT_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        subscription_webhook_secret: std::env::var("SUBSCRIPTION_WEBHOOK_SECRET")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
         message_tx,
         music_tx,
     };

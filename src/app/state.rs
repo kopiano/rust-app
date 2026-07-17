@@ -15,6 +15,8 @@ pub struct AppState {
     pub github_client_id: String,
     pub github_client_secret: String,
     pub github_redirect_uri: String,
+    pub pro_checkout_url: Option<String>,
+    pub subscription_webhook_secret: Option<String>,
     pub message_tx: broadcast::Sender<MessageBroadcast>,
     pub music_tx: broadcast::Sender<MusicProcessingBroadcast>,
 }
