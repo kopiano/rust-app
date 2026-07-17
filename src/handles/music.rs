@@ -10,7 +10,7 @@ use std::{
 use axum::{
     Extension, Json,
     extract::{
-        Multipart, Path as AxumPath, State, WebSocketUpgrade,
+        Multipart, Path as AxumPath, Query, State, WebSocketUpgrade,
         multipart::Field,
         ws::{Message as WsMessage, WebSocket},
     },
@@ -28,7 +28,8 @@ use crate::{
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::music::{
-        Music, MusicFavoriteState, MusicListItem, MusicProcessingBroadcast, UpdateMusicFavorite,
+        Music, MusicFavoriteState, MusicListItem, MusicListPage, MusicProcessingBroadcast,
+        UpdateMusicFavorite,
     },
     services::ncm::{self, DecryptedNcm},
 };
@@ -128,25 +129,98 @@ enum InsertMusicError {
     Internal,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MusicListQuery {
+    page: Option<i64>,
+    #[serde(alias = "pagesize")]
+    page_size: Option<i64>,
+    favorite: Option<bool>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MusicListStats {
+    total: i64,
+    total_duration_ms: i64,
+}
+
+impl MusicListQuery {
+    fn pagination(&self) -> (i64, i64, i64) {
+        let page = self.page.unwrap_or(1).max(1);
+        let page_size = self.page_size.unwrap_or(10).clamp(1, 50);
+        let offset = (page - 1).saturating_mul(page_size);
+        (page, page_size, offset)
+    }
+}
+
+#[cfg(test)]
+mod music_list_query_tests {
+    use super::MusicListQuery;
+
+    #[test]
+    fn pagination_uses_defaults_and_clamps_limits() {
+        let defaults = MusicListQuery {
+            page: None,
+            page_size: None,
+            favorite: None,
+        };
+        assert_eq!(defaults.pagination(), (1, 10, 0));
+
+        let clamped = MusicListQuery {
+            page: Some(0),
+            page_size: Some(100),
+            favorite: Some(true),
+        };
+        assert_eq!(clamped.pagination(), (1, 50, 0));
+
+        let second_page = MusicListQuery {
+            page: Some(2),
+            page_size: Some(8),
+            favorite: None,
+        };
+        assert_eq!(second_page.pagination(), (2, 8, 8));
+    }
+}
+
 pub async fn public_list(
     State(state): State<AppState>,
-) -> Result<Json<ApiResponse<Vec<MusicListItem>>>, StatusCode> {
-    let music = sqlx::query_as::<_, MusicListItem>(
+    Query(query): Query<MusicListQuery>,
+) -> Result<Json<ApiResponse<MusicListPage>>, StatusCode> {
+    let (page, page_size, offset) = query.pagination();
+    let items_query = sqlx::query_as::<_, MusicListItem>(
         r#"
-        SELECT id, title, artist, album, cover_url, is_favorite,
+        SELECT id, title, artist, album, duration_ms, cover_url, is_favorite,
                processing_status, processing_error, created_at
         FROM music
+        WHERE processing_status <> 'failed'
+          AND ($1::BOOLEAN IS NULL OR is_favorite = $1)
         ORDER BY created_at DESC, id DESC
+        LIMIT $2 OFFSET $3
         "#,
     )
-    .fetch_all(&state.db)
-    .await
-    .map_err(|error| {
+    .bind(query.favorite)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.db);
+    let stats_query = sqlx::query_as::<_, MusicListStats>(
+        r#"
+        SELECT COUNT(*)::BIGINT AS total,
+               COALESCE(SUM(duration_ms), 0)::BIGINT AS total_duration_ms
+        FROM music
+        WHERE processing_status <> 'failed'
+          AND ($1::BOOLEAN IS NULL OR is_favorite = $1)
+        "#,
+    )
+    .bind(query.favorite)
+    .fetch_one(&state.db);
+
+    let (items, stats) = tokio::try_join!(items_query, stats_query).map_err(|error| {
         tracing::error!(%error, "Failed to list public music");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(ApiResponse::success(music)))
+    Ok(Json(ApiResponse::success(music_list_page(
+        items, page, page_size, stats,
+    ))))
 }
 
 pub async fn public_get(
@@ -178,26 +252,70 @@ pub async fn public_get(
 pub async fn list(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
-) -> Result<Json<ApiResponse<Vec<MusicListItem>>>, StatusCode> {
+    Query(query): Query<MusicListQuery>,
+) -> Result<Json<ApiResponse<MusicListPage>>, StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let music = sqlx::query_as::<_, MusicListItem>(
+    let (page, page_size, offset) = query.pagination();
+    let items_query = sqlx::query_as::<_, MusicListItem>(
         r#"
-        SELECT id, title, artist, album, cover_url, is_favorite,
+        SELECT id, title, artist, album, duration_ms, cover_url, is_favorite,
                processing_status, processing_error, created_at
         FROM music
         WHERE user_id = $1
+          AND processing_status <> 'failed'
+          AND ($2::BOOLEAN IS NULL OR is_favorite = $2)
         ORDER BY created_at DESC, id DESC
+        LIMIT $3 OFFSET $4
         "#,
     )
     .bind(user_id)
-    .fetch_all(&state.db)
-    .await
-    .map_err(|error| {
+    .bind(query.favorite)
+    .bind(page_size)
+    .bind(offset)
+    .fetch_all(&state.db);
+    let stats_query = sqlx::query_as::<_, MusicListStats>(
+        r#"
+        SELECT COUNT(*)::BIGINT AS total,
+               COALESCE(SUM(duration_ms), 0)::BIGINT AS total_duration_ms
+        FROM music
+        WHERE user_id = $1
+          AND processing_status <> 'failed'
+          AND ($2::BOOLEAN IS NULL OR is_favorite = $2)
+        "#,
+    )
+    .bind(user_id)
+    .bind(query.favorite)
+    .fetch_one(&state.db);
+
+    let (items, stats) = tokio::try_join!(items_query, stats_query).map_err(|error| {
         tracing::error!(%error, %user_id, "Failed to list music");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(ApiResponse::success(music)))
+    Ok(Json(ApiResponse::success(music_list_page(
+        items, page, page_size, stats,
+    ))))
+}
+
+fn music_list_page(
+    items: Vec<MusicListItem>,
+    page: i64,
+    page_size: i64,
+    stats: MusicListStats,
+) -> MusicListPage {
+    let total_pages = if stats.total == 0 {
+        0
+    } else {
+        (stats.total + page_size - 1) / page_size
+    };
+    MusicListPage {
+        items,
+        page,
+        page_size,
+        total: stats.total,
+        total_pages,
+        total_duration_ms: stats.total_duration_ms,
+    }
 }
 
 pub async fn websocket(
