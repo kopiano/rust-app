@@ -52,6 +52,7 @@ async fn main() {
         message_tx,
         music_tx,
     };
+    handles::subscription::reconcile_pending_payment_reviewer_notifications(&state).await;
 
     // router
     let app = app::router::create_router(state);

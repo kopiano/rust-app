@@ -36,10 +36,7 @@ async fn refresh_online_status(state: &AppState, user_id: Uuid) -> redis::RedisR
         .await
 }
 
-async fn load_online_statuses(
-    state: &AppState,
-    user_ids: &HashSet<Uuid>,
-) -> HashMap<Uuid, bool> {
+async fn load_online_statuses(state: &AppState, user_ids: &HashSet<Uuid>) -> HashMap<Uuid, bool> {
     if user_ids.is_empty() {
         return HashMap::new();
     }
@@ -117,7 +114,12 @@ pub async fn send(
                 &Uuid::NAMESPACE_URL,
                 format!("private:{first}:{second}").as_bytes(),
             );
-            (Some(receiver_id), None, vec![sender_id, receiver_id], conversation_id)
+            (
+                Some(receiver_id),
+                None,
+                vec![sender_id, receiver_id],
+                conversation_id,
+            )
         }
         "public" => {
             let group_id = input.group_id.ok_or(StatusCode::BAD_REQUEST)?;

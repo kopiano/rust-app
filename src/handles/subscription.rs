@@ -17,6 +17,7 @@ use crate::models::message::{Message, MessageBroadcast};
 
 const WEBHOOK_SECRET_HEADER: &str = "x-subscription-webhook-secret";
 const SYSTEM_USER_EMAIL: &str = "system@internal.local";
+const PAYMENT_REVIEWER_USERNAMES: [&str; 2] = ["admin", "shville"];
 
 #[derive(Debug, Deserialize)]
 pub struct CheckoutInput {
@@ -40,6 +41,147 @@ pub struct SubscriptionWebhookInput {
     pub status: String,
     pub subscription_start_at: Option<DateTime<Utc>>,
     pub subscription_end_at: Option<DateTime<Utc>>,
+}
+
+pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) {
+    let system_user_id = match sqlx::query_scalar::<_, Uuid>(
+        r#"SELECT id FROM "user" WHERE email = $1"#,
+    )
+    .bind(SYSTEM_USER_EMAIL)
+    .fetch_optional(&state.db)
+    .await
+    {
+        Ok(Some(system_user_id)) => system_user_id,
+        Ok(None) => {
+            tracing::warn!(
+                "System notification account is missing; skipped payment notification reconciliation"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::error!(%error, "Failed to load system notification account for reconciliation");
+            return;
+        }
+    };
+    let reviewers = match sqlx::query_as::<_, (Uuid, String)>(
+        r#"SELECT id, name FROM "user" WHERE name = ANY($1::text[]) ORDER BY name"#,
+    )
+    .bind(&PAYMENT_REVIEWER_USERNAMES[..])
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(reviewers) => reviewers,
+        Err(error) => {
+            tracing::error!(%error, "Failed to load payment reviewers for reconciliation");
+            return;
+        }
+    };
+    let orders =
+        match sqlx::query_as::<_, (String, String, String, String, String, String, String)>(
+            r#"
+        SELECT
+            subscription_order.order_no,
+            "user".name,
+            "user".email,
+            subscription_order.billing_cycle,
+            subscription_order.payment_method,
+            subscription_order.currency,
+            subscription_order.amount::text
+        FROM subscription_order
+        INNER JOIN "user" ON "user".id = subscription_order.user_id
+        WHERE subscription_order.status = 'pending_confirmation'
+        ORDER BY subscription_order.created_at ASC
+        "#,
+        )
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(orders) => orders,
+            Err(error) => {
+                tracing::error!(%error, "Failed to load pending payment orders for reconciliation");
+                return;
+            }
+        };
+
+    let mut broadcasts = Vec::new();
+    for (
+        order_no,
+        purchaser_name,
+        purchaser_email,
+        billing_cycle,
+        payment_method,
+        currency,
+        amount,
+    ) in orders
+    {
+        for (reviewer_id, reviewer_name) in &reviewers {
+            let notification_kind = format!("payment-reviewer:{reviewer_name}");
+            let client_message_id =
+                system_notification_client_message_id(&order_no, &notification_kind, *reviewer_id);
+            let message_exists = match sqlx::query_scalar::<_, bool>(
+                r#"SELECT EXISTS(SELECT 1 FROM "message" WHERE send_id = $1 AND client_message_id = $2)"#,
+            )
+            .bind(system_user_id)
+            .bind(client_message_id)
+            .fetch_one(&state.db)
+            .await
+            {
+                Ok(message_exists) => message_exists,
+                Err(error) => {
+                    tracing::error!(%error, %order_no, reviewer = %reviewer_name, "Failed to check payment notification");
+                    continue;
+                }
+            };
+            if message_exists {
+                continue;
+            }
+
+            let mut transaction = match state.db.begin().await {
+                Ok(transaction) => transaction,
+                Err(error) => {
+                    tracing::error!(%error, %order_no, reviewer = %reviewer_name, "Failed to start payment notification reconciliation transaction");
+                    continue;
+                }
+            };
+            let content = payment_reviewer_content(
+                &purchaser_name,
+                &purchaser_email,
+                &order_no,
+                &billing_cycle,
+                &payment_method,
+                &currency,
+                &amount,
+            );
+            let message = match insert_system_private_message(
+                &mut transaction,
+                system_user_id,
+                *reviewer_id,
+                &order_no,
+                &notification_kind,
+                content,
+            )
+            .await
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::error!(%error, %order_no, reviewer = %reviewer_name, "Failed to create missing payment notification");
+                    continue;
+                }
+            };
+            if let Err(error) = transaction.commit().await {
+                tracing::error!(%error, %order_no, reviewer = %reviewer_name, "Failed to commit payment notification reconciliation");
+                continue;
+            }
+            broadcasts.push((message, vec![system_user_id, *reviewer_id]));
+        }
+    }
+    if !broadcasts.is_empty() {
+        tracing::info!(
+            count = broadcasts.len(),
+            "Reconciled missing pending payment notifications"
+        );
+        broadcast_messages(state, broadcasts);
+    }
 }
 
 pub async fn create_pro_checkout(
@@ -93,20 +235,22 @@ pub async fn create_pro_checkout(
                 .into_response();
         }
     };
-    let administrators = match admin_users(&mut transaction).await {
-        Ok(administrators) if !administrators.is_empty() => administrators,
+    let payment_reviewers = match payment_reviewers(&mut transaction).await {
+        Ok(payment_reviewers) if payment_reviewers.len() == PAYMENT_REVIEWER_USERNAMES.len() => {
+            payment_reviewers
+        }
         Ok(_) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ApiResponse::<()>::error(
                     503,
-                    "No payment administrator is configured.",
+                    "Payment reviewers admin and shville must be configured.",
                 )),
             )
                 .into_response();
         }
         Err(error) => {
-            tracing::error!(%error, "Failed to load payment administrators");
+            tracing::error!(%error, "Failed to load payment reviewers");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -152,7 +296,7 @@ pub async fn create_pro_checkout(
     let user_content = format!(
         "你的 Pro 支付申请已提交，订单号：{order_no}，金额：{currency} {amount}。请完成支付，管理员确认到账后将为你开通 Pro 权限。"
     );
-    let mut broadcasts = Vec::with_capacity(administrators.len() + 1);
+    let mut broadcasts = Vec::with_capacity(payment_reviewers.len() + 1);
     match insert_system_private_message(
         &mut transaction,
         system_user_id,
@@ -169,29 +313,29 @@ pub async fn create_pro_checkout(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    for (admin_id, admin_name) in administrators {
-        let admin_content = format!(
-            "待确认 Pro 支付\n用户：{} ({})\n订单号：{order_no}\n套餐：Pro {}\n支付方式：{}\n金额：{} {}\n请在确认到账后发放权限。",
-            purchaser.0,
-            purchaser.1,
-            billing_cycle_label(billing_cycle),
-            payment_method_label(payment_method),
+    for (reviewer_id, reviewer_name) in payment_reviewers {
+        let admin_content = payment_reviewer_content(
+            &purchaser.0,
+            &purchaser.1,
+            &order_no,
+            billing_cycle,
+            payment_method,
             currency,
             amount,
         );
         match insert_system_private_message(
             &mut transaction,
             system_user_id,
-            admin_id,
+            reviewer_id,
             &order_no,
-            &format!("admin:{admin_name}"),
+            &format!("payment-reviewer:{reviewer_name}"),
             admin_content,
         )
         .await
         {
-            Ok(message) => broadcasts.push((message, vec![system_user_id, admin_id])),
+            Ok(message) => broadcasts.push((message, vec![system_user_id, reviewer_id])),
             Err(error) => {
-                tracing::error!(%error, %order_no, "Failed to notify payment administrator");
+                tracing::error!(%error, %order_no, "Failed to notify payment reviewer");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         }
@@ -440,10 +584,11 @@ async fn system_user_id(transaction: &mut Transaction<'_, Postgres>) -> Result<U
         .await
 }
 
-async fn admin_users(
+async fn payment_reviewers(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-    sqlx::query_as(r#"SELECT id, name FROM "user" WHERE is_admin = TRUE ORDER BY name"#)
+    sqlx::query_as(r#"SELECT id, name FROM "user" WHERE name = ANY($1::text[]) ORDER BY name"#)
+        .bind(&PAYMENT_REVIEWER_USERNAMES[..])
         .fetch_all(&mut **transaction)
         .await
 }
@@ -465,10 +610,8 @@ async fn insert_system_private_message(
         &Uuid::NAMESPACE_URL,
         format!("private:{first}:{second}").as_bytes(),
     );
-    let client_message_id = Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("subscription:{order_no}:{notification_kind}:{receiver_id}").as_bytes(),
-    );
+    let client_message_id =
+        system_notification_client_message_id(order_no, notification_kind, receiver_id);
 
     sqlx::query_as::<_, Message>(
         r#"
@@ -491,6 +634,37 @@ async fn insert_system_private_message(
     .bind(content)
     .fetch_one(&mut **transaction)
     .await
+}
+
+fn system_notification_client_message_id(
+    order_no: &str,
+    notification_kind: &str,
+    receiver_id: Uuid,
+) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("subscription:{order_no}:{notification_kind}:{receiver_id}").as_bytes(),
+    )
+}
+
+fn payment_reviewer_content(
+    purchaser_name: &str,
+    purchaser_email: &str,
+    order_no: &str,
+    billing_cycle: &str,
+    payment_method: &str,
+    currency: &str,
+    amount: &str,
+) -> String {
+    format!(
+        "待确认 Pro 支付\n用户：{} ({})\n订单号：{order_no}\n套餐：Pro {}\n支付方式：{}\n金额：{} {}\n请在确认到账后发放权限。",
+        purchaser_name,
+        purchaser_email,
+        billing_cycle_label(billing_cycle),
+        payment_method_label(payment_method),
+        currency,
+        amount,
+    )
 }
 
 fn broadcast_messages(state: &AppState, messages: Vec<(Message, Vec<Uuid>)>) {
