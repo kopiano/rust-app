@@ -692,6 +692,7 @@ pub struct MessageHistoryQuery {
     pub chat_type: String,
     pub contact_id: Uuid,
     pub limit: Option<i64>,
+    pub before_id: Option<i64>,
 }
 
 pub async fn history(
@@ -745,11 +746,13 @@ pub async fn history(
         FROM "message"
         WHERE conversation_id = $1
           AND deleted_at IS NULL
+          AND ($2::BIGINT IS NULL OR id < $2)
         ORDER BY created_at DESC, id DESC
-        LIMIT $2
+        LIMIT $3
         "#,
     )
     .bind(conversation_id)
+    .bind(query.before_id)
     .bind(limit)
     .fetch_all(&state.db)
     .await
@@ -889,6 +892,11 @@ pub async fn user_info(
             u.avatar,
             u.name AS username,
             FALSE AS online,
+            (
+                LOWER(BTRIM(u.plan)) = 'pro'
+                AND LOWER(BTRIM(u.subscription_status)) = 'active'
+                AND (u.subscription_end_at IS NULL OR u.subscription_end_at > NOW())
+            ) AS is_pro,
             pl.content,
             pl.last_message_time,
             '[]'::jsonb AS members
@@ -905,6 +913,7 @@ pub async fn user_info(
             c.avatar,
             c.name AS username,
             NULL::boolean AS online,
+            FALSE AS is_pro,
             gl.content,
             gl.last_message_time,
             COALESCE((

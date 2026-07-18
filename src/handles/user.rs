@@ -13,6 +13,8 @@ use crate::common::response::ApiResponse;
 use crate::middleware::jwt::Claims;
 use crate::models::user::{CreateUser, UpdateProfileInput, UpdateUser, User};
 
+const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
+
 pub async fn me(
     State(state): State<AppState>,
     Extension(claims): Extension<Claims>,
@@ -105,8 +107,6 @@ pub async fn profile(
     Extension(claims): Extension<Claims>,
     Json(input): Json<UpdateProfileInput>,
 ) -> Result<Json<ApiResponse<User>>, StatusCode> {
-    const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
-
     let user_id = claims
         .sub
         .parse::<Uuid>()
@@ -129,46 +129,13 @@ pub async fn profile(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let avatar = if input.avatar.trim().is_empty() {
-        None
-    } else if current.avatar.as_deref() == Some(input.avatar.as_str()) {
-        current.avatar.clone()
-    } else {
-        let image_bytes = decode_avatar(&input.avatar)?;
-        if image_bytes.len() > MAX_AVATAR_BYTES {
-            return Err(StatusCode::PAYLOAD_TOO_LARGE);
-        }
-        let image = image::load_from_memory(&image_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
-        let resized = image.thumbnail(512, 512);
-        let filename = format!(
-            "avatar-{}-{}.webp",
-            avatar_name_component(username),
-            chrono::Utc::now().timestamp_millis()
-        );
-        let directory = std::path::Path::new("src/assets/avatar");
-        tokio::fs::create_dir_all(directory)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let path = directory.join(&filename);
-        let mut encoded = Cursor::new(Vec::new());
-        resized
-            .write_to(&mut encoded, ImageFormat::WebP)
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        tokio::fs::write(path, encoded.into_inner())
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Some(format!("/api/assets/avatar/{filename}"))
-    };
-
-    let password_hash = if input.password.trim().is_empty() {
-        current.password_hash
-    } else {
-        let password = input.password;
-        tokio::task::spawn_blocking(move || bcrypt::hash(password, 8))
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let username = username.to_owned();
+    let (avatar, password_hash) = tokio::join!(
+        prepare_profile_avatar(&username, &input.avatar, current.avatar.as_deref()),
+        hash_profile_password(input.password, current.password_hash),
+    );
+    let avatar = avatar?;
+    let password_hash = password_hash?;
 
     sqlx::query_as::<_, User>(
         r##"UPDATE "user" SET
@@ -194,6 +161,64 @@ pub async fn profile(
         }
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+async fn prepare_profile_avatar(
+    username: &str,
+    avatar_value: &str,
+    current_avatar: Option<&str>,
+) -> Result<Option<String>, StatusCode> {
+    if avatar_value.trim().is_empty() {
+        return Ok(None);
+    }
+    if current_avatar == Some(avatar_value) {
+        return Ok(current_avatar.map(str::to_owned));
+    }
+
+    let image_bytes = decode_avatar(avatar_value)?;
+    if image_bytes.len() > MAX_AVATAR_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let filename = format!(
+        "avatar-{}-{}.webp",
+        avatar_name_component(username),
+        chrono::Utc::now().timestamp_millis()
+    );
+    let directory = std::path::Path::new("src/assets/avatar");
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let path = directory.join(&filename);
+    let encoded = tokio::task::spawn_blocking(move || {
+        let image = image::load_from_memory(&image_bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let resized = image.thumbnail(512, 512);
+        let mut encoded = Cursor::new(Vec::new());
+        resized
+            .write_to(&mut encoded, ImageFormat::WebP)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        Ok::<_, StatusCode>(encoded.into_inner())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+    tokio::fs::write(path, encoded)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Some(format!("/api/assets/avatar/{filename}")))
+}
+
+async fn hash_profile_password(
+    password: String,
+    current_password_hash: String,
+) -> Result<String, StatusCode> {
+    if password.trim().is_empty() {
+        return Ok(current_password_hash);
+    }
+    tokio::task::spawn_blocking(move || bcrypt::hash(password, 8))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn decode_avatar(value: &str) -> Result<Vec<u8>, StatusCode> {

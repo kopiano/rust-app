@@ -74,6 +74,7 @@ pub struct MessageUserInfo {
     pub username: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub online: Option<bool>,
+    pub is_pro: bool,
     pub content: Option<String>,
     pub last_message_time: Option<DateTime<Utc>>,
     pub members: sqlx::types::Json<Vec<ChatMemberInfo>>,
