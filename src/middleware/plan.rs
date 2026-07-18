@@ -17,7 +17,7 @@ pub fn has_library_access(
     subscription_status: &str,
     subscription_end_at: Option<DateTime<Utc>>,
 ) -> bool {
-    let paid_plan = matches!(plan.trim().to_ascii_lowercase().as_str(), "pro" | "plus");
+    let paid_plan = plan.trim().eq_ignore_ascii_case("pro");
     let active = subscription_status.trim().eq_ignore_ascii_case("active");
     let not_expired = subscription_end_at.is_none_or(|end_at| end_at > Utc::now());
     paid_plan && active && not_expired
@@ -87,14 +87,16 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn library_access_is_limited_to_paid_plans() {
+    fn library_access_requires_an_active_pro_plan() {
         assert!(has_library_access("pro", "active", None));
         assert!(has_library_access(
-            "PLUS",
+            "PRO",
             "active",
             Some(Utc::now() + Duration::days(1))
         ));
+        assert!(!has_library_access("plus", "active", None));
         assert!(!has_library_access("free", "active", None));
+        assert!(!has_library_access("pro", "", None));
         assert!(!has_library_access("pro", "expired", None));
         assert!(!has_library_access(
             "pro",
