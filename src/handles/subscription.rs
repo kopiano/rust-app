@@ -18,7 +18,6 @@ use crate::models::message::{Message, MessageBroadcast};
 
 const WEBHOOK_SECRET_HEADER: &str = "x-subscription-webhook-secret";
 const SYSTEM_USER_EMAIL: &str = "system@internal.local";
-const PAYMENT_REVIEWER_USERNAMES: [&str; 2] = ["admin", "shville"];
 
 #[derive(Debug, Deserialize)]
 pub struct CheckoutInput {
@@ -66,9 +65,8 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
         }
     };
     let reviewers = match sqlx::query_as::<_, (Uuid, String)>(
-        r#"SELECT id, name FROM "user" WHERE name = ANY($1::text[]) ORDER BY name"#,
+        r#"SELECT id, name FROM "user" WHERE role = 'super_admin' ORDER BY name"#,
     )
-    .bind(&PAYMENT_REVIEWER_USERNAMES[..])
     .fetch_all(&state.db)
     .await
     {
@@ -108,8 +106,8 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
     let client_message_ids = orders
         .iter()
         .flat_map(|(order_no, _, _, _, _, _, _)| {
-            reviewers.iter().map(move |(reviewer_id, reviewer_name)| {
-                let notification_kind = format!("payment-reviewer:{reviewer_name}");
+            reviewers.iter().map(move |(reviewer_id, _reviewer_name)| {
+                let notification_kind = format!("pro-review:{reviewer_id}");
                 system_notification_client_message_id(order_no, &notification_kind, *reviewer_id)
             })
         })
@@ -150,7 +148,7 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
     ) in orders
     {
         for (reviewer_id, reviewer_name) in &reviewers {
-            let notification_kind = format!("payment-reviewer:{reviewer_name}");
+            let notification_kind = format!("pro-review:{reviewer_id}");
             let client_message_id =
                 system_notification_client_message_id(&order_no, &notification_kind, *reviewer_id);
             if existing_client_message_ids.contains(&client_message_id) {
@@ -256,16 +254,14 @@ pub async fn create_pro_checkout(
                 .into_response();
         }
     };
-    let payment_reviewers = match payment_reviewers(&mut transaction).await {
-        Ok(payment_reviewers) if payment_reviewers.len() == PAYMENT_REVIEWER_USERNAMES.len() => {
-            payment_reviewers
-        }
+    let payment_reviewers = match super_admin_reviewers(&mut transaction).await {
+        Ok(payment_reviewers) if !payment_reviewers.is_empty() => payment_reviewers,
         Ok(_) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ApiResponse::<()>::error(
                     503,
-                    "Payment reviewers admin and shville must be configured.",
+                    "At least one super administrator must be configured.",
                 )),
             )
                 .into_response();
@@ -315,7 +311,7 @@ pub async fn create_pro_checkout(
     }
 
     let user_content = format!(
-        "你的 Pro 支付申请已提交，订单号：{order_no}，金额：{currency} {amount}。请完成支付，管理员确认到账后将为你开通 Pro 权限。"
+        "你的 Pro 支付申请已提交，订单号：{order_no}，金额：{currency} {amount}。请完成支付，超级管理员确认到账后将为你开通 Pro 权限。"
     );
     let mut broadcasts = Vec::with_capacity(payment_reviewers.len() + 1);
     match insert_system_private_message(
@@ -334,7 +330,7 @@ pub async fn create_pro_checkout(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    for (reviewer_id, reviewer_name) in payment_reviewers {
+    for (reviewer_id, _reviewer_name) in payment_reviewers {
         let admin_content = payment_reviewer_content(
             &purchaser.0,
             &purchaser.1,
@@ -349,7 +345,7 @@ pub async fn create_pro_checkout(
             system_user_id,
             reviewer_id,
             &order_no,
-            &format!("payment-reviewer:{reviewer_name}"),
+            &format!("pro-review:{reviewer_id}"),
             admin_content,
         )
         .await
@@ -379,27 +375,26 @@ pub async fn confirm_order(
     Extension(claims): Extension<Claims>,
     Path(order_no): Path<String>,
 ) -> Response {
-    let administrator_id = match claims.sub.parse::<Uuid>() {
+    let super_admin_id = match claims.sub.parse::<Uuid>() {
         Ok(user_id) => user_id,
         Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
     };
     if !valid_order_no(&order_no) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let is_admin =
-        match sqlx::query_scalar::<_, bool>(r#"SELECT is_admin FROM "user" WHERE id = $1"#)
-            .bind(administrator_id)
-            .fetch_optional(&state.db)
-            .await
-        {
-            Ok(Some(is_admin)) => is_admin,
-            Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
-            Err(error) => {
-                tracing::error!(%error, %administrator_id, "Failed to check payment administrator");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-    if !is_admin {
+    let role = match sqlx::query_scalar::<_, String>(r#"SELECT role FROM "user" WHERE id = $1"#)
+        .bind(super_admin_id)
+        .fetch_optional(&state.db)
+        .await
+    {
+        Ok(Some(role)) => role,
+        Ok(None) => return StatusCode::UNAUTHORIZED.into_response(),
+        Err(error) => {
+            tracing::error!(%error, %super_admin_id, "Failed to check payment super administrator");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if role != "super_admin" {
         return StatusCode::FORBIDDEN.into_response();
     }
 
@@ -465,7 +460,7 @@ pub async fn confirm_order(
         "#,
     )
     .bind(&order_no)
-    .bind(administrator_id)
+    .bind(super_admin_id)
     .execute(&mut *transaction)
     .await
     {
@@ -536,6 +531,16 @@ pub async fn webhook(
             .into_response();
     }
     let event_status = input.status.trim().to_ascii_lowercase();
+    if requires_super_admin_review(&requested_plan, &event_status) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<()>::error(
+                400,
+                "Pro subscriptions require super administrator approval.",
+            )),
+        )
+            .into_response();
+    }
     let now = Utc::now();
     let (plan, subscription_status, subscription_start_at, subscription_end_at) =
         match event_status.as_str() {
@@ -605,11 +610,10 @@ async fn system_user_id(transaction: &mut Transaction<'_, Postgres>) -> Result<U
         .await
 }
 
-async fn payment_reviewers(
+async fn super_admin_reviewers(
     transaction: &mut Transaction<'_, Postgres>,
 ) -> Result<Vec<(Uuid, String)>, sqlx::Error> {
-    sqlx::query_as(r#"SELECT id, name FROM "user" WHERE name = ANY($1::text[]) ORDER BY name"#)
-        .bind(&PAYMENT_REVIEWER_USERNAMES[..])
+    sqlx::query_as(r#"SELECT id, name FROM "user" WHERE role = 'super_admin' ORDER BY name"#)
         .fetch_all(&mut **transaction)
         .await
 }
@@ -678,7 +682,7 @@ fn payment_reviewer_content(
     amount: &str,
 ) -> String {
     format!(
-        "待确认 Pro 支付\n用户：{} ({})\n订单号：{order_no}\n套餐：Pro {}\n支付方式：{}\n金额：{} {}\n请在确认到账后发放权限。",
+        "待审核 Pro 申请\n用户：{} ({})\n订单号：{order_no}\n套餐：Pro {}\n支付方式：{}\n金额：{} {}\n请在确认到账后开通 Pro 套餐。",
         purchaser_name,
         purchaser_email,
         billing_cycle_label(billing_cycle),
@@ -859,11 +863,16 @@ fn valid_plan(plan: &str) -> bool {
         })
 }
 
+fn requires_super_admin_review(plan: &str, status: &str) -> bool {
+    plan == "pro" && matches!(status, "active" | "paid" | "succeeded")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         normalize_billing_cycle, normalize_contact_email, normalize_currency,
-        normalize_payment_method, normalize_return_to, valid_order_no, valid_plan,
+        normalize_payment_method, normalize_return_to, requires_super_admin_review, valid_order_no,
+        valid_plan,
     };
 
     #[test]
@@ -883,6 +892,15 @@ mod tests {
         assert!(!valid_plan("Pro"));
         assert!(!valid_plan(""));
         assert!(!valid_plan("plan_with_underscore"));
+    }
+
+    #[test]
+    fn pro_activation_requires_super_admin_review() {
+        assert!(requires_super_admin_review("pro", "active"));
+        assert!(requires_super_admin_review("pro", "paid"));
+        assert!(requires_super_admin_review("pro", "succeeded"));
+        assert!(!requires_super_admin_review("pro", "expired"));
+        assert!(!requires_super_admin_review("free", "active"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub struct User {
     pub email: String,
     pub github_id: Option<String>,
     pub avatar: Option<String>,
+    pub role: String,
     pub plan: String,
     pub subscription_status: String,
     pub subscription_start_at: Option<DateTime<Utc>>,
