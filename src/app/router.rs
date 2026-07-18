@@ -117,6 +117,14 @@ fn message_api(state: AppState) -> Router<AppState> {
         ) // send image, testing
         .route("/message/history", get(message::history)) // chat message history
         .route("/message/user_info", get(message::user_info)) // group and contacts
+        .route(
+            "/message/group",
+            post(message::create_group).layer(DefaultBodyLimit::max(7 * 1024 * 1024)),
+        )
+        .route(
+            "/message/group/{id}/members",
+            post(message::add_group_members),
+        )
         .route("/message/ws", get(message::websocket))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }

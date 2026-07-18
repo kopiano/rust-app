@@ -112,7 +112,7 @@ pub async fn profile(
         .parse::<Uuid>()
         .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let username = input.username.trim();
-    if username.is_empty() || input.avatar.trim().is_empty() {
+    if username.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
@@ -129,8 +129,10 @@ pub async fn profile(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    let avatar = if input.avatar == current.avatar.clone().unwrap_or_default() {
-        input.avatar
+    let avatar = if input.avatar.trim().is_empty() {
+        None
+    } else if current.avatar.as_deref() == Some(input.avatar.as_str()) {
+        current.avatar.clone()
     } else {
         let image_bytes = decode_avatar(&input.avatar)?;
         if image_bytes.len() > MAX_AVATAR_BYTES {
@@ -155,7 +157,7 @@ pub async fn profile(
         tokio::fs::write(path, encoded.into_inner())
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        format!("/api/assets/avatar/{filename}")
+        Some(format!("/api/assets/avatar/{filename}"))
     };
 
     let password_hash = if input.password.trim().is_empty() {

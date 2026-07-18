@@ -13,6 +13,31 @@ pub struct SendMessageRequest {
     pub client_message_id: Uuid,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateGroupRequest {
+    pub name: String,
+    pub member_ids: Vec<Uuid>,
+    pub avatar: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AddGroupMembersRequest {
+    pub member_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateGroupResponse {
+    pub group_id: Uuid,
+    pub name: String,
+    pub avatar: Option<String>,
+    pub member_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AddGroupMembersResponse {
+    pub added_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 #[allow(dead_code)]
 pub struct Message {

@@ -1,10 +1,11 @@
 use axum::{
     Extension, Json,
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-    extract::{Multipart, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::ImageFormat;
 use redis::AsyncCommands;
 use serde::Deserialize;
@@ -18,7 +19,10 @@ use crate::{
     app::AppState,
     common::response::ApiResponse,
     middleware::jwt::Claims,
-    models::message::{Message, MessageBroadcast, MessageUserInfo, SendMessageRequest},
+    models::message::{
+        AddGroupMembersRequest, AddGroupMembersResponse, CreateGroupRequest, CreateGroupResponse,
+        Message, MessageBroadcast, MessageUserInfo, SendMessageRequest,
+    },
 };
 
 const ONLINE_TTL_SECONDS: u64 = 60;
@@ -438,9 +442,211 @@ fn image_name_component(username: &str) -> String {
     }
 }
 
+fn decode_group_avatar(value: &str) -> Result<Vec<u8>, StatusCode> {
+    let encoded = value
+        .strip_prefix("data:image/")
+        .and_then(|value| value.split_once(";base64,").map(|(_, encoded)| encoded))
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    STANDARD
+        .decode(encoded)
+        .map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn group_avatar_filename(creator_name: &str, timestamp_millis: i64) -> String {
+    format!(
+        "group-{}-{timestamp_millis}.webp",
+        image_name_component(creator_name)
+    )
+}
+
+async fn store_group_avatar(creator_name: &str, value: &str) -> Result<String, StatusCode> {
+    const MAX_AVATAR_BYTES: usize = 5 * 1024 * 1024;
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let bytes = decode_group_avatar(value)?;
+    if bytes.len() > MAX_AVATAR_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let encoded = tokio::task::spawn_blocking(move || {
+        let image = image::load_from_memory(&bytes)?;
+        let mut output = Cursor::new(Vec::new());
+        image
+            .thumbnail(512, 512)
+            .write_to(&mut output, ImageFormat::WebP)?;
+        Ok::<_, image::ImageError>(output.into_inner())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let filename = group_avatar_filename(creator_name, chrono::Utc::now().timestamp_millis());
+    let directory = std::path::Path::new("src/assets/avatar");
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::fs::write(directory.join(&filename), encoded)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(format!("/api/assets/avatar/{filename}"))
+}
+
+pub async fn create_group(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<CreateGroupRequest>,
+) -> Result<Json<ApiResponse<CreateGroupResponse>>, StatusCode> {
+    let creator_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 255 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let member_ids = input
+        .member_ids
+        .into_iter()
+        .filter(|member_id| *member_id != creator_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if member_ids.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let existing_user_count =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "user" WHERE id = ANY($1)"#)
+            .bind(&member_ids)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if existing_user_count as usize != member_ids.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let creator_name = sqlx::query_scalar::<_, String>(r#"SELECT name FROM "user" WHERE id = $1"#)
+        .bind(creator_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let avatar = store_group_avatar(&creator_name, &input.avatar).await?;
+    let mut transaction = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let group_id = sqlx::query_scalar::<_, Uuid>(
+        r#"INSERT INTO "group" (name, avatar) VALUES ($1, $2) RETURNING id"#,
+    )
+    .bind(name)
+    .bind(&avatar)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %creator_id, "Failed to create group");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let mut all_member_ids = member_ids;
+    all_member_ids.push(creator_id);
+    sqlx::query("INSERT INTO group_member (group_id, user_id) SELECT $1, UNNEST($2::uuid[])")
+        .bind(group_id)
+        .bind(&all_member_ids)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %creator_id, %group_id, "Failed to add initial group members");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    transaction
+        .commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(ApiResponse::success(CreateGroupResponse {
+        group_id,
+        name: name.to_string(),
+        avatar: Some(avatar),
+        member_count: all_member_ids.len(),
+    })))
+}
+
+pub async fn add_group_members(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(group_id): Path<Uuid>,
+    Json(input): Json<AddGroupMembersRequest>,
+) -> Result<Json<ApiResponse<AddGroupMembersResponse>>, StatusCode> {
+    let requester_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let requester_is_member = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM group_member WHERE group_id = $1 AND user_id = $2)",
+    )
+    .bind(group_id)
+    .bind(requester_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !requester_is_member {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let member_ids = input
+        .member_ids
+        .into_iter()
+        .filter(|member_id| *member_id != requester_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if member_ids.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let existing_user_count =
+        sqlx::query_scalar::<_, i64>(r#"SELECT COUNT(*) FROM "user" WHERE id = ANY($1)"#)
+            .bind(&member_ids)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if existing_user_count as usize != member_ids.len() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let result = sqlx::query(
+        r#"
+        INSERT INTO group_member (group_id, user_id)
+        SELECT $1, UNNEST($2::uuid[])
+        ON CONFLICT (group_id, user_id) DO NOTHING
+        "#,
+    )
+    .bind(group_id)
+    .bind(&member_ids)
+    .execute(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %requester_id, %group_id, "Failed to add group members");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    Ok(Json(ApiResponse::success(AddGroupMembersResponse {
+        added_count: result.rows_affected(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{encode_chat_image, image_name_component};
+    use super::{
+        decode_group_avatar, encode_chat_image, group_avatar_filename, image_name_component,
+    };
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat};
     use std::io::Cursor;
 
@@ -462,6 +668,22 @@ mod tests {
     fn sanitizes_username_for_image_filename() {
         assert_eq!(image_name_component("Alice Smith"), "alice-smith");
         assert_eq!(image_name_component("用户"), "user");
+    }
+
+    #[test]
+    fn decodes_group_avatar_data_url() {
+        let bytes = b"group-avatar";
+        let value = format!("data:image/png;base64,{}", STANDARD.encode(bytes));
+        assert_eq!(decode_group_avatar(&value).unwrap(), bytes);
+        assert!(decode_group_avatar("https://example.com/avatar.png").is_err());
+    }
+
+    #[test]
+    fn names_group_avatar_with_creator_and_timestamp() {
+        assert_eq!(
+            group_avatar_filename("Alice Smith", 1_752_812_345_678),
+            "group-alice-smith-1752812345678.webp"
+        );
     }
 }
 

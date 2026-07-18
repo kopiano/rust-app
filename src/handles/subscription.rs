@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use sqlx::{Postgres, Transaction};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::app::AppState;
@@ -21,6 +22,7 @@ const PAYMENT_REVIEWER_USERNAMES: [&str; 2] = ["admin", "shville"];
 
 #[derive(Debug, Deserialize)]
 pub struct CheckoutInput {
+    #[allow(dead_code)]
     pub return_to: Option<String>,
     pub payment_method: Option<String>,
     pub contact_email: Option<String>,
@@ -103,6 +105,39 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
             }
         };
 
+    let client_message_ids = orders
+        .iter()
+        .flat_map(|(order_no, _, _, _, _, _, _)| {
+            reviewers.iter().map(move |(reviewer_id, reviewer_name)| {
+                let notification_kind = format!("payment-reviewer:{reviewer_name}");
+                system_notification_client_message_id(order_no, &notification_kind, *reviewer_id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let existing_client_message_ids = if client_message_ids.is_empty() {
+        HashSet::new()
+    } else {
+        match sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT client_message_id
+            FROM "message"
+            WHERE send_id = $1
+              AND client_message_id = ANY($2::uuid[])
+            "#,
+        )
+        .bind(system_user_id)
+        .bind(&client_message_ids)
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(error) => {
+                tracing::error!(%error, "Failed to load existing payment notifications");
+                return;
+            }
+        }
+    };
+
     let mut broadcasts = Vec::new();
     for (
         order_no,
@@ -118,21 +153,7 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
             let notification_kind = format!("payment-reviewer:{reviewer_name}");
             let client_message_id =
                 system_notification_client_message_id(&order_no, &notification_kind, *reviewer_id);
-            let message_exists = match sqlx::query_scalar::<_, bool>(
-                r#"SELECT EXISTS(SELECT 1 FROM "message" WHERE send_id = $1 AND client_message_id = $2)"#,
-            )
-            .bind(system_user_id)
-            .bind(client_message_id)
-            .fetch_one(&state.db)
-            .await
-            {
-                Ok(message_exists) => message_exists,
-                Err(error) => {
-                    tracing::error!(%error, %order_no, reviewer = %reviewer_name, "Failed to check payment notification");
-                    continue;
-                }
-            };
-            if message_exists {
+            if existing_client_message_ids.contains(&client_message_id) {
                 continue;
             }
 
@@ -718,6 +739,7 @@ fn valid_order_no(order_no: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == b'-')
 }
 
+#[allow(dead_code)]
 fn build_checkout_url(
     state: &AppState,
     user_id: Uuid,
@@ -757,6 +779,7 @@ fn build_checkout_url(
     Ok(checkout_url.to_string())
 }
 
+#[allow(dead_code)]
 fn frontend_url(configured_frontend: &str, path: &str) -> Result<Url, (StatusCode, &'static str)> {
     let mut url = Url::parse(configured_frontend)
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Invalid frontend URL."))?;
@@ -771,6 +794,7 @@ fn frontend_url(configured_frontend: &str, path: &str) -> Result<Url, (StatusCod
     Ok(url)
 }
 
+#[allow(dead_code)]
 fn normalize_return_to(value: Option<&str>) -> String {
     let value = value.unwrap_or("/music").trim();
     if value.starts_with('/') && !value.starts_with("//") && !value.contains('\\') {
