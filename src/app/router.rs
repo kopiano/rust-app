@@ -1,18 +1,19 @@
 use crate::app::AppState;
-use crate::handles::{auth, message, moment, music, subscription, task, user};
+use crate::handles::{auth, message, moment, music, subscription, task, user, video};
 use crate::middleware::{cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::{HeaderValue, header::CACHE_CONTROL},
     middleware,
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 use tower::ServiceBuilder;
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
 const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const MAX_VIDEO_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
 
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
@@ -21,6 +22,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(message_api(state.clone()))
         .merge(moment_api(state.clone()))
         .merge(music_api(state.clone()))
+        .merge(video_api(state.clone()))
         .merge(subscription_api(state.clone()))
         .merge(task_api(state.clone()));
 
@@ -52,6 +54,15 @@ pub fn create_router(state: AppState) -> Router {
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
                 .service(ServeDir::new("src/assets/moment")),
+        )
+        .nest_service(
+            "/api/assets/video",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                ))
+                .service(ServeDir::new("src/assets/video")),
         )
         .nest_service(
             "/api/assets/music",
@@ -183,6 +194,58 @@ fn music_api(state: AppState) -> Router<AppState> {
         .route("/music/{id}/favorite", put(music::favorite))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new().merge(public).merge(library).merge(private)
+}
+
+fn video_api(state: AppState) -> Router<AppState> {
+    let public = Router::new()
+        .route("/video", get(video::list))
+        .route("/video/categories", get(video::categories))
+        .route("/video/collections", get(video::collections))
+        .route("/video/{id}", get(video::get))
+        .route("/video/{id}/comments", get(video::comments))
+        .route("/video/{id}/view", post(video::view))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt::optional_auth,
+        ));
+
+    let authenticated = Router::new()
+        .route(
+            "/video/upload",
+            post(video::upload).layer(DefaultBodyLimit::max(MAX_VIDEO_BODY_BYTES)),
+        )
+        .route(
+            "/video/{id}",
+            patch(video::update)
+                .delete(video::delete)
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/video/{id}/like", post(video::like).delete(video::unlike))
+        .route(
+            "/video/{id}/favorite",
+            post(video::favorite).delete(video::unfavorite),
+        )
+        .route("/video/{id}/comments", post(video::create_comment))
+        .route(
+            "/video/comments/{id}/like",
+            post(video::like_comment).delete(video::unlike_comment),
+        )
+        .route("/video/collections", post(video::create_collection))
+        .route(
+            "/video/collections/{id}",
+            patch(video::update_collection).delete(video::delete_collection),
+        )
+        .route(
+            "/video/collections/{id}/items",
+            post(video::add_collection_item),
+        )
+        .route(
+            "/video/collections/{collection_id}/items/{video_id}",
+            axum::routing::delete(video::remove_collection_item),
+        )
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+
+    Router::new().merge(public).merge(authenticated)
 }
 
 fn subscription_api(state: AppState) -> Router<AppState> {
