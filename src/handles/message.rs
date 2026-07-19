@@ -921,8 +921,9 @@ pub async fn user_info(
                     'user_id', u.id,
                     'avatar', u.avatar,
                     'username', u.name,
-                    'online', false
-                ) ORDER BY u.name)
+                    'online', false,
+                    'created_at', cm.created_at
+                ) ORDER BY cm.created_at ASC, cm.user_id ASC)
                 FROM group_member cm
                 JOIN "user" u ON u.id = cm.user_id
                 WHERE cm.group_id = c.id

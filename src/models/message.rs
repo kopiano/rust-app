@@ -86,4 +86,5 @@ pub struct ChatMemberInfo {
     pub avatar: Option<String>,
     pub username: String,
     pub online: bool,
+    pub created_at: DateTime<Utc>,
 }
