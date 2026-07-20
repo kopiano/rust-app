@@ -1,0 +1,2 @@
+ALTER TABLE video_collection
+    ADD COLUMN IF NOT EXISTS include_favorites BOOLEAN NOT NULL DEFAULT FALSE;

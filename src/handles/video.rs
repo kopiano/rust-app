@@ -30,9 +30,9 @@ use crate::{
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::video::{
-        AddVideoCollectionItem, CreateVideoCollection, CreateVideoComment, UpdateVideoCollection,
-        Video, VideoCategory, VideoCollection, VideoComment, VideoCommentLikeState, VideoListPage,
-        VideoReactionState, VideoUploadSession, VideoViewState,
+        CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
+        VideoCollection, VideoComment, VideoCommentLikeState, VideoListPage, VideoReactionState,
+        VideoUploadSession, VideoViewState,
     },
 };
 
@@ -147,11 +147,18 @@ pub async fn list(
     }
 
     let scope = query.scope.as_deref().unwrap_or("public");
-    if !matches!(scope, "public" | "accessible" | "mine" | "favorites") {
+    if !matches!(
+        scope,
+        "public" | "accessible" | "mine" | "favorites" | "collection"
+    ) {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if matches!(scope, "accessible" | "mine" | "favorites") && user_id.is_none() {
-        return Err(StatusCode::UNAUTHORIZED);
+    if matches!(scope, "accessible" | "mine" | "favorites")
+        || (scope == "collection" && query.collection_id.is_none())
+    {
+        if user_id.is_none() {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
     }
 
     let limit = query
@@ -223,6 +230,55 @@ pub async fn list(
                         AND video.published_at IS NOT NULL
                     )
                 )
+                WHEN 'collection' THEN
+                    EXISTS (
+                        SELECT 1
+                        FROM video_collection
+                        WHERE video_collection.id = $8
+                          AND (
+                              video.user_id = video_collection.user_id
+                              OR (
+                                  video_collection.include_favorites
+                                  AND EXISTS (
+                                      SELECT 1 FROM video_favorite
+                                      WHERE video_favorite.video_id = video.id
+                                        AND video_favorite.user_id = video_collection.user_id
+                                  )
+                                  AND video.visibility = 'public'
+                                  AND video.status = 'ready'
+                                  AND video.published_at IS NOT NULL
+                              )
+                          )
+                          AND (
+                              video_collection.category_slug IS NULL
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM regexp_split_to_table(
+                                      regexp_replace(
+                                          COALESCE(video.description, ''),
+                                          '#',
+                                          '',
+                                          'g'
+                                      ),
+                                      '\s+'
+                                  ) AS video_category
+                                  WHERE lower(video_category)
+                                      = lower(video_collection.category_slug)
+                              )
+                          )
+                          AND (
+                              video_collection.visibility = 'public'
+                              OR video_collection.user_id = $3
+                          )
+                          AND (
+                              video.user_id = $3
+                              OR (
+                                  video.visibility = 'public'
+                                  AND video.status = 'ready'
+                                  AND video.published_at IS NOT NULL
+                              )
+                          )
+                    )
                 WHEN 'accessible' THEN
                     (
                         video.user_id = $3
@@ -261,29 +317,6 @@ pub async fn list(
                       ON video_category.id = video_category_map.category_id
                   WHERE video_category_map.video_id = video.id
                     AND video_category.slug = $5
-              )
-          )
-          AND (
-              $8::uuid IS NULL
-              OR EXISTS (
-                  SELECT 1
-                  FROM video_collection_item
-                  INNER JOIN video_collection
-                      ON video_collection.id = video_collection_item.collection_id
-                  WHERE video_collection_item.video_id = video.id
-                    AND video_collection_item.collection_id = $8
-                    AND (
-                        video_collection.visibility = 'public'
-                        OR video_collection.user_id = $3
-                    )
-                    AND (
-                        video.user_id = $3
-                        OR (
-                            video.visibility = 'public'
-                            AND video.status = 'ready'
-                            AND video.published_at IS NOT NULL
-                        )
-                    )
               )
           )
         ORDER BY video.created_at DESC, video.id DESC
@@ -338,10 +371,10 @@ pub async fn categories(
 ) -> Result<Json<ApiResponse<Vec<VideoCategory>>>, StatusCode> {
     let user_id = optional_user_id(claims)?;
     let scope = query.scope.as_deref().unwrap_or("public");
-    if !matches!(scope, "public" | "accessible") {
+    if !matches!(scope, "public" | "accessible" | "mine") {
         return Err(StatusCode::BAD_REQUEST);
     }
-    if scope == "accessible" && user_id.is_none() {
+    if matches!(scope, "accessible" | "mine") && user_id.is_none() {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -356,13 +389,18 @@ pub async fn categories(
             INNER JOIN video ON video.id = video_category_map.video_id
             WHERE video_category_map.category_id = video_category.id
               AND video.status = 'ready'
-              AND (
-                  ($2::text = 'accessible' AND video.user_id = $1)
-                  OR (
+              AND CASE $2::text
+                  WHEN 'mine' THEN video.user_id = $1
+                  WHEN 'accessible' THEN
+                      video.user_id = $1
+                      OR (
+                          video.visibility = 'public'
+                          AND video.published_at IS NOT NULL
+                      )
+                  ELSE
                       video.visibility = 'public'
                       AND video.published_at IS NOT NULL
-                  )
-              )
+              END
         )
         ORDER BY video_category.name_en ASC, video_category.id ASC
         "#,
@@ -1281,13 +1319,44 @@ pub async fn collections(
                "user".name AS username, "user".avatar,
                video_collection.title, video_collection.description,
                video_collection.visibility,
-               COUNT(video.id)::bigint AS video_count,
+               video_collection.include_favorites,
+               video_collection.category_slug,
+               COUNT(DISTINCT video.id)::bigint AS video_count,
                COALESCE(SUM(video.view_count), 0)::bigint AS total_views,
                (
                    SELECT cover_video.cover_url
-                   FROM video_collection_item AS cover_item
-                   INNER JOIN video AS cover_video ON cover_video.id = cover_item.video_id
-                   WHERE cover_item.collection_id = video_collection.id
+                   FROM video AS cover_video
+                   WHERE (
+                         cover_video.user_id = video_collection.user_id
+                         OR (
+                             video_collection.include_favorites
+                             AND EXISTS (
+                                 SELECT 1 FROM video_favorite
+                                 WHERE video_favorite.video_id = cover_video.id
+                                   AND video_favorite.user_id = video_collection.user_id
+                             )
+                             AND cover_video.visibility = 'public'
+                             AND cover_video.status = 'ready'
+                             AND cover_video.published_at IS NOT NULL
+                         )
+                   )
+                     AND (
+                         video_collection.category_slug IS NULL
+                         OR EXISTS (
+                             SELECT 1
+                             FROM regexp_split_to_table(
+                                 regexp_replace(
+                                     COALESCE(cover_video.description, ''),
+                                     '#',
+                                     '',
+                                     'g'
+                                 ),
+                                 '\s+'
+                             ) AS video_category
+                             WHERE lower(video_category)
+                                 = lower(video_collection.category_slug)
+                         )
+                     )
                      AND (
                          cover_video.user_id = $1
                          OR (
@@ -1296,16 +1365,44 @@ pub async fn collections(
                              AND cover_video.published_at IS NOT NULL
                          )
                      )
-                   ORDER BY cover_item.position ASC, cover_item.created_at ASC
+                   ORDER BY cover_video.created_at DESC, cover_video.id DESC
                    LIMIT 1
                ) AS cover_url,
                video_collection.created_at, video_collection.updated_at
         FROM video_collection
         INNER JOIN "user" ON "user".id = video_collection.user_id
-        LEFT JOIN video_collection_item
-            ON video_collection_item.collection_id = video_collection.id
         LEFT JOIN video
-            ON video.id = video_collection_item.video_id
+            ON (
+                video.user_id = video_collection.user_id
+                OR (
+                    video_collection.include_favorites
+                    AND EXISTS (
+                        SELECT 1 FROM video_favorite
+                        WHERE video_favorite.video_id = video.id
+                          AND video_favorite.user_id = video_collection.user_id
+                    )
+                    AND video.visibility = 'public'
+                    AND video.status = 'ready'
+                    AND video.published_at IS NOT NULL
+                )
+            )
+           AND (
+               video_collection.category_slug IS NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM regexp_split_to_table(
+                       regexp_replace(
+                           COALESCE(video.description, ''),
+                           '#',
+                           '',
+                           'g'
+                       ),
+                       '\s+'
+                   ) AS video_category
+                   WHERE lower(video_category)
+                       = lower(video_collection.category_slug)
+               )
+           )
            AND (
                video.user_id = $1
                OR (
@@ -1341,10 +1438,42 @@ pub async fn create_collection(
     let user_id = authenticated_user_id(&claims)?;
     let title = validate_collection_title(&input.title)?;
     let visibility = validate_visibility(input.visibility.as_deref().unwrap_or("public"))?;
+    let category_slug = input
+        .category_slug
+        .as_deref()
+        .map(normalize_slug)
+        .filter(|value| !value.is_empty());
+    if let Some(category_slug) = category_slug.as_deref() {
+        let belongs_to_playlist = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM video_category_map
+                INNER JOIN video_category
+                    ON video_category.id = video_category_map.category_id
+                INNER JOIN video
+                    ON video.id = video_category_map.video_id
+                WHERE video_category.slug = $1
+                  AND video.user_id = $2
+                  AND video.status = 'ready'
+            )
+            "#,
+        )
+        .bind(category_slug)
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(internal_db_error)?;
+        if !belongs_to_playlist {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
     let collection_id = sqlx::query_scalar::<_, Uuid>(
         r#"
-        INSERT INTO video_collection (user_id, title, description, visibility)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO video_collection (
+            user_id, title, description, visibility, include_favorites, category_slug
+        )
+        VALUES ($1, $2, $3, $4, $5, $6)
         RETURNING id
         "#,
     )
@@ -1352,6 +1481,8 @@ pub async fn create_collection(
     .bind(title)
     .bind(input.description.and_then(non_empty))
     .bind(visibility)
+    .bind(input.include_favorites)
+    .bind(category_slug)
     .fetch_one(&state.db)
     .await
     .map_err(internal_db_error)?;
@@ -1382,6 +1513,8 @@ pub async fn update_collection(
         SET title = COALESCE($3, title),
             description = CASE WHEN $4 THEN $5 ELSE description END,
             visibility = COALESCE($6, visibility),
+            include_favorites = COALESCE($7, include_favorites),
+            category_slug = COALESCE($8, category_slug),
             updated_at = NOW()
         WHERE id = $1 AND user_id = $2
         "#,
@@ -1392,6 +1525,14 @@ pub async fn update_collection(
     .bind(input.description.is_some())
     .bind(input.description.and_then(non_empty))
     .bind(visibility)
+    .bind(input.include_favorites)
+    .bind(
+        input
+            .category_slug
+            .as_deref()
+            .map(normalize_slug)
+            .filter(|value| !value.is_empty()),
+    )
     .execute(&state.db)
     .await
     .map_err(internal_db_error)?;
@@ -1418,78 +1559,6 @@ pub async fn delete_collection(
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(ApiResponse::success(())))
-}
-
-pub async fn add_collection_item(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath(collection_id): AxumPath<Uuid>,
-    Json(input): Json<AddVideoCollectionItem>,
-) -> Result<Json<ApiResponse<VideoCollection>>, StatusCode> {
-    let user_id = authenticated_user_id(&claims)?;
-    let result = sqlx::query(
-        r#"
-        INSERT INTO video_collection_item (collection_id, video_id, position)
-        SELECT video_collection.id, video.id, GREATEST($4, 0)
-        FROM video_collection
-        INNER JOIN video ON video.id = $3
-        WHERE video_collection.id = $1
-          AND video_collection.user_id = $2
-          AND (
-              video.user_id = $2
-              OR (
-                  video.visibility = 'public'
-                  AND video.status = 'ready'
-                  AND video.published_at IS NOT NULL
-              )
-          )
-        ON CONFLICT (collection_id, video_id)
-        DO UPDATE SET position = EXCLUDED.position
-        "#,
-    )
-    .bind(collection_id)
-    .bind(user_id)
-    .bind(input.video_id)
-    .bind(input.position.unwrap_or(i32::MAX))
-    .execute(&state.db)
-    .await
-    .map_err(internal_db_error)?;
-    if result.rows_affected() == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    Ok(Json(ApiResponse::success(
-        load_collection(&state.db, collection_id, Some(user_id)).await?,
-    )))
-}
-
-pub async fn remove_collection_item(
-    State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
-    AxumPath((collection_id, video_id)): AxumPath<(Uuid, Uuid)>,
-) -> Result<Json<ApiResponse<VideoCollection>>, StatusCode> {
-    let user_id = authenticated_user_id(&claims)?;
-    let result = sqlx::query(
-        r#"
-        DELETE FROM video_collection_item
-        USING video_collection
-        WHERE video_collection_item.collection_id = video_collection.id
-          AND video_collection.id = $1
-          AND video_collection.user_id = $2
-          AND video_collection_item.video_id = $3
-        "#,
-    )
-    .bind(collection_id)
-    .bind(user_id)
-    .bind(video_id)
-    .execute(&state.db)
-    .await
-    .map_err(internal_db_error)?;
-    if result.rows_affected() == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    Ok(Json(ApiResponse::success(
-        load_collection(&state.db, collection_id, Some(user_id)).await?,
-    )))
 }
 
 async fn load_video(
@@ -1842,13 +1911,44 @@ async fn load_collection(
                "user".name AS username, "user".avatar,
                video_collection.title, video_collection.description,
                video_collection.visibility,
-               COUNT(video.id)::bigint AS video_count,
+               video_collection.include_favorites,
+               video_collection.category_slug,
+               COUNT(DISTINCT video.id)::bigint AS video_count,
                COALESCE(SUM(video.view_count), 0)::bigint AS total_views,
                (
                    SELECT cover_video.cover_url
-                   FROM video_collection_item AS cover_item
-                   INNER JOIN video AS cover_video ON cover_video.id = cover_item.video_id
-                   WHERE cover_item.collection_id = video_collection.id
+                   FROM video AS cover_video
+                   WHERE (
+                         cover_video.user_id = video_collection.user_id
+                         OR (
+                             video_collection.include_favorites
+                             AND EXISTS (
+                                 SELECT 1 FROM video_favorite
+                                 WHERE video_favorite.video_id = cover_video.id
+                                   AND video_favorite.user_id = video_collection.user_id
+                             )
+                             AND cover_video.visibility = 'public'
+                             AND cover_video.status = 'ready'
+                             AND cover_video.published_at IS NOT NULL
+                         )
+                   )
+                     AND (
+                         video_collection.category_slug IS NULL
+                         OR EXISTS (
+                             SELECT 1
+                             FROM regexp_split_to_table(
+                                 regexp_replace(
+                                     COALESCE(cover_video.description, ''),
+                                     '#',
+                                     '',
+                                     'g'
+                                 ),
+                                 '\s+'
+                             ) AS video_category
+                             WHERE lower(video_category)
+                                 = lower(video_collection.category_slug)
+                         )
+                     )
                      AND (
                          cover_video.user_id = $2
                          OR (
@@ -1857,16 +1957,44 @@ async fn load_collection(
                              AND cover_video.published_at IS NOT NULL
                          )
                      )
-                   ORDER BY cover_item.position ASC, cover_item.created_at ASC
+                   ORDER BY cover_video.created_at DESC, cover_video.id DESC
                    LIMIT 1
                ) AS cover_url,
                video_collection.created_at, video_collection.updated_at
         FROM video_collection
         INNER JOIN "user" ON "user".id = video_collection.user_id
-        LEFT JOIN video_collection_item
-            ON video_collection_item.collection_id = video_collection.id
         LEFT JOIN video
-            ON video.id = video_collection_item.video_id
+            ON (
+                video.user_id = video_collection.user_id
+                OR (
+                    video_collection.include_favorites
+                    AND EXISTS (
+                        SELECT 1 FROM video_favorite
+                        WHERE video_favorite.video_id = video.id
+                          AND video_favorite.user_id = video_collection.user_id
+                    )
+                    AND video.visibility = 'public'
+                    AND video.status = 'ready'
+                    AND video.published_at IS NOT NULL
+                )
+            )
+           AND (
+               video_collection.category_slug IS NULL
+               OR EXISTS (
+                   SELECT 1
+                   FROM regexp_split_to_table(
+                       regexp_replace(
+                           COALESCE(video.description, ''),
+                           '#',
+                           '',
+                           'g'
+                       ),
+                       '\s+'
+                   ) AS video_category
+                   WHERE lower(video_category)
+                       = lower(video_collection.category_slug)
+               )
+           )
            AND (
                video.user_id = $2
                OR (
@@ -2006,6 +2134,7 @@ fn spawn_uploaded_video_processing(
     output_directory: PathBuf,
 ) {
     tokio::spawn(async move {
+        tracing::info!(%video_id, "Started uploaded video metadata inspection");
         let metadata = match probe_video_metadata(&source_path).await {
             Ok(metadata) => metadata,
             Err(status) => {
@@ -2018,6 +2147,13 @@ fn spawn_uploaded_video_processing(
                 return;
             }
         };
+        tracing::info!(
+            %video_id,
+            duration_us = metadata.duration_us,
+            width = metadata.width,
+            height = metadata.height,
+            "Uploaded video metadata inspection completed"
+        );
         let size = match tokio::fs::metadata(&source_path).await {
             Ok(metadata) => metadata.len().min(i64::MAX as u64) as i64,
             Err(error) => {
@@ -2057,6 +2193,7 @@ fn spawn_uploaded_video_processing(
 
         match updated {
             Ok(result) if result.rows_affected() == 1 => {
+                tracing::info!(%video_id, "Uploaded video marked as processing");
                 spawn_video_processing(
                     db,
                     video_id,
@@ -2067,7 +2204,12 @@ fn spawn_uploaded_video_processing(
                     },
                 );
             }
-            Ok(_) => {}
+            Ok(_) => {
+                tracing::warn!(
+                    %video_id,
+                    "Skipped uploaded video processing because its status changed"
+                );
+            }
             Err(error) => {
                 tracing::error!(%error, %video_id, "Failed to finalize uploaded video");
                 mark_video_processing_failed(
@@ -2107,13 +2249,13 @@ async fn transcode_video_to_hls(
     output_directory: &FsPath,
     duration_us: u64,
 ) -> Result<(), StatusCode> {
+    tracing::info!(%video_id, "Video processing queued for transcode slot");
     let _permit = VIDEO_TRANSCODE_SLOTS
         .acquire()
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    tracing::info!(%video_id, "Video processing acquired transcode slot");
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
-    // Publish a usable fallback poster before HLS transcoding so processing cards can render it.
-    generate_video_poster(&ffmpeg, source_path, output_directory, duration_us).await?;
     let playlist_path = output_directory.join("master.m3u8");
     let segment_pattern = output_directory.join("segment-%05d.ts");
     let mut child = Command::new(&ffmpeg)
@@ -2143,6 +2285,8 @@ async fn transcode_video_to_hls(
             tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg for video");
             StatusCode::SERVICE_UNAVAILABLE
         })?;
+    update_processing_progress(db, video_id, 1).await;
+    tracing::info!(%video_id, executable = %ffmpeg, "Started FFmpeg video HLS transcoding");
     let stdout = child
         .stdout
         .take()
@@ -2163,13 +2307,10 @@ async fn transcode_video_to_hls(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        let Some(out_time_us) = line
-            .strip_prefix("out_time_us=")
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
+        let Some(out_time_us) = parse_ffmpeg_out_time_us(&line) else {
             continue;
         };
-        let progress = ((out_time_us.saturating_mul(99) / duration_us).min(99)) as i16;
+        let progress = ((out_time_us.saturating_mul(99) / duration_us.max(1)).min(99)) as i16;
         if progress > last_progress {
             last_progress = progress;
             update_processing_progress(db, video_id, progress).await;
@@ -2188,7 +2329,15 @@ async fn transcode_video_to_hls(
         );
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
+    tracing::info!(%video_id, "FFmpeg video HLS transcoding completed; generating poster");
+    generate_video_poster(&ffmpeg, source_path, output_directory, duration_us).await?;
     Ok(())
+}
+
+fn parse_ffmpeg_out_time_us(line: &str) -> Option<u64> {
+    line.strip_prefix("out_time_us=")
+        .or_else(|| line.strip_prefix("out_time_ms="))
+        .and_then(|value| value.parse::<u64>().ok())
 }
 
 async fn update_processing_progress(db: &PgPool, video_id: Uuid, progress: i16) {
@@ -2215,7 +2364,14 @@ async fn generate_video_poster(
     output_directory: &FsPath,
     duration_us: u64,
 ) -> Result<(), StatusCode> {
+    // A user-selected cover always wins over the generated poster.
     if tokio::fs::try_exists(output_directory.join("cover.webp"))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        return Ok(());
+    }
+    if tokio::fs::try_exists(output_directory.join("poster.webp"))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {

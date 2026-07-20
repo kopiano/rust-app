@@ -15,6 +15,7 @@
 * Logging：tracing
 * cookie保存jwt
 * 实时通信：websocket
+* 视频转码：ffmpeg
 
 ### install
 * 未创建项目目录

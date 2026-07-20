@@ -108,6 +108,8 @@ pub struct VideoCollection {
     pub title: String,
     pub description: Option<String>,
     pub visibility: String,
+    pub include_favorites: bool,
+    pub category_slug: Option<String>,
     pub video_count: i64,
     pub total_views: i64,
     pub cover_url: Option<String>,
@@ -127,6 +129,9 @@ pub struct CreateVideoCollection {
     pub title: String,
     pub description: Option<String>,
     pub visibility: Option<String>,
+    #[serde(default)]
+    pub include_favorites: bool,
+    pub category_slug: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,10 +139,6 @@ pub struct UpdateVideoCollection {
     pub title: Option<String>,
     pub description: Option<String>,
     pub visibility: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AddVideoCollectionItem {
-    pub video_id: Uuid,
-    pub position: Option<i32>,
+    pub include_favorites: Option<bool>,
+    pub category_slug: Option<String>,
 }

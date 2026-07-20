@@ -247,14 +247,6 @@ fn video_api(state: AppState) -> Router<AppState> {
             "/video/collections/{id}",
             patch(video::update_collection).delete(video::delete_collection),
         )
-        .route(
-            "/video/collections/{id}/items",
-            post(video::add_collection_item),
-        )
-        .route(
-            "/video/collections/{collection_id}/items/{video_id}",
-            axum::routing::delete(video::remove_collection_item),
-        )
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
 
     Router::new().merge(public).merge(authenticated)
