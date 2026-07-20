@@ -1667,45 +1667,34 @@ async fn replace_video_categories(
         .execute(&mut **transaction)
         .await
         .map_err(internal_db_error)?;
-    for slug in slugs {
-        let display = slug
-            .split('-')
-            .filter(|part| !part.is_empty())
-            .map(|part| {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        let category_id = sqlx::query_scalar::<_, Uuid>(
-            r#"
+    if slugs.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        WITH input AS (
+            SELECT slug, INITCAP(REPLACE(slug, '-', ' ')) AS display
+            FROM UNNEST($2::text[]) AS input_slug(slug)
+        ),
+        categories AS (
             INSERT INTO video_category (slug, name_zh, name_en)
-            VALUES ($1, $2, $2)
+            SELECT slug, display, display
+            FROM input
             ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug
             RETURNING id
-            "#,
         )
-        .bind(slug)
-        .bind(display)
-        .fetch_one(&mut **transaction)
-        .await
-        .map_err(internal_db_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO video_category_map (video_id, category_id)
-            VALUES ($1, $2)
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(video_id)
-        .bind(category_id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(internal_db_error)?;
-    }
+        INSERT INTO video_category_map (video_id, category_id)
+        SELECT $1, id
+        FROM categories
+        ON CONFLICT DO NOTHING
+        "#,
+    )
+    .bind(video_id)
+    .bind(slugs)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal_db_error)?;
     Ok(())
 }
 
@@ -2084,6 +2073,24 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
 
 fn spawn_video_processing(db: PgPool, video_id: Uuid, pending: PendingVideo) {
     tokio::spawn(async move {
+        let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
+        if let Err(status) = generate_video_poster(
+            &ffmpeg,
+            &pending.source_path,
+            &pending.output_directory,
+            pending.duration_us,
+        )
+        .await
+        {
+            tracing::warn!(
+                %video_id,
+                %status,
+                "Unable to generate the early video poster; transcoding will retry"
+            );
+        } else {
+            tracing::info!(%video_id, "Generated video poster before HLS transcoding");
+        }
+
         let result = transcode_video_to_hls(
             &db,
             video_id,
