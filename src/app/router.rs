@@ -13,7 +13,8 @@ use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 
 const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
-const MAX_VIDEO_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
+const MAX_VIDEO_BODY_BYTES: usize = 6 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
+const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
@@ -210,6 +211,17 @@ fn video_api(state: AppState) -> Router<AppState> {
         ));
 
     let authenticated = Router::new()
+        .route("/video/uploads", post(video::create_upload))
+        .route("/video/uploads/{upload_id}", get(video::upload_status))
+        .route(
+            "/video/uploads/{upload_id}/chunk",
+            put(video::upload_chunk)
+                .layer(DefaultBodyLimit::max(MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES)),
+        )
+        .route(
+            "/video/uploads/{upload_id}/complete",
+            post(video::complete_upload),
+        )
         .route(
             "/video/upload",
             post(video::upload).layer(DefaultBodyLimit::max(MAX_VIDEO_BODY_BYTES)),

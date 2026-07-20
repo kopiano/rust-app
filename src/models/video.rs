@@ -89,6 +89,16 @@ pub struct VideoViewState {
     pub view_count: i64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoUploadSession {
+    pub upload_id: Uuid,
+    pub video: Video,
+    pub chunk_size: u64,
+    pub uploaded_bytes: u64,
+    pub total_bytes: u64,
+    pub complete: bool,
+}
+
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct VideoCollection {
     pub id: Uuid,

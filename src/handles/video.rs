@@ -1,11 +1,12 @@
 use std::{
-    io::Cursor,
+    io::{Cursor, SeekFrom},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
 };
 
 use axum::{
     Extension, Json,
+    body::Bytes,
     extract::{Multipart, Path as AxumPath, Query, State, multipart::Field},
     http::{
         HeaderMap, StatusCode,
@@ -18,7 +19,7 @@ use image::ImageFormat;
 use serde::Deserialize;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
     process::Command,
     sync::Semaphore,
 };
@@ -31,13 +32,14 @@ use crate::{
     models::video::{
         AddVideoCollectionItem, CreateVideoCollection, CreateVideoComment, UpdateVideoCollection,
         Video, VideoCategory, VideoCollection, VideoComment, VideoCommentLikeState, VideoListPage,
-        VideoReactionState, VideoViewState,
+        VideoReactionState, VideoUploadSession, VideoViewState,
     },
 };
 
 const VIDEO_ASSET_ROOT: &str = "src/assets/video";
 const VIDEO_ASSET_URL: &str = "/api/assets/video";
-const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const MAX_VIDEO_BYTES: usize = 6 * 1024 * 1024 * 1024;
+const VIDEO_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 255;
 const MAX_DESCRIPTION_CHARS: usize = 10_000;
@@ -45,6 +47,9 @@ const MAX_COMMENT_CHARS: usize = 1_000;
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
 const HLS_SEGMENT_SECONDS: &str = "6";
+const VIDEO_COVER_WIDTH: u32 = 1920;
+const VIDEO_COVER_HEIGHT: u32 = 1080;
+const VIDEO_POSTER_CANDIDATE_COUNT: u32 = 12;
 const VIDEO_VIEW_UTC_OFFSET_HOURS: i64 = 8;
 const VIDEO_VISITOR_COOKIE: &str = "video_visitor_id";
 static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
@@ -113,6 +118,22 @@ struct PendingVideo {
     source_path: PathBuf,
     output_directory: PathBuf,
     duration_us: u64,
+}
+
+#[derive(Deserialize)]
+pub struct CreateVideoUpload {
+    file_name: String,
+    content_type: Option<String>,
+    total_bytes: u64,
+}
+
+#[derive(sqlx::FromRow)]
+struct UploadStateRow {
+    video_id: Uuid,
+    file_extension: String,
+    total_bytes: i64,
+    uploaded_bytes: i64,
+    status: String,
 }
 
 pub async fn list(
@@ -203,7 +224,13 @@ pub async fn list(
                     )
                 )
                 WHEN 'accessible' THEN
-                    video.user_id = $3
+                    (
+                        video.user_id = $3
+                        AND (
+                            video.status = 'ready'
+                            OR video.published_at IS NOT NULL
+                        )
+                    )
                     OR (
                         video.visibility = 'public'
                         AND video.status = 'ready'
@@ -434,59 +461,263 @@ pub async fn upload(
         }
         return Err(StatusCode::BAD_REQUEST);
     };
-    let metadata = match probe_video_metadata(&source_path).await {
-        Ok(metadata) => metadata,
-        Err(status) => {
-            cleanup_failed_video_upload(&state.db, video_id, &output_directory).await;
-            return Err(status);
-        }
-    };
-    let size = match tokio::fs::metadata(&source_path).await {
-        Ok(metadata) => metadata.len().min(i64::MAX as u64) as i64,
-        Err(_) => {
-            cleanup_failed_video_upload(&state.db, video_id, &output_directory).await;
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
-    };
-    let updated = sqlx::query(
-        r#"
-        UPDATE video
-        SET duration = $3,
-            width = $4,
-            height = $5,
-            fps = $6::double precision::numeric,
-            size = $7,
-            status = 'processing',
-            processing_progress = 0,
-            processing_error = NULL,
-            updated_at = NOW()
-        WHERE id = $1 AND user_id = $2 AND status = 'uploading'
-        "#,
+    let video = load_video(&state.db, video_id, Some(user_id)).await?;
+    spawn_uploaded_video_processing(state.db.clone(), video_id, source_path, output_directory);
+    Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(video))))
+}
+
+pub async fn create_upload(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<CreateVideoUpload>,
+) -> Result<(StatusCode, Json<ApiResponse<VideoUploadSession>>), StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    if input.total_bytes == 0 || input.total_bytes > MAX_VIDEO_BYTES as u64 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    let extension = video_extension(
+        input.content_type.as_deref(),
+        Some(input.file_name.as_str()),
     )
-    .bind(video_id)
-    .bind(user_id)
-    .bind(((metadata.duration_us + 999_999) / 1_000_000) as i32)
-    .bind(metadata.width as i32)
-    .bind(metadata.height as i32)
-    .bind(metadata.fps)
-    .bind(size)
-    .execute(&state.db)
-    .await;
-    if let Err(error) = updated {
-        tracing::error!(%error, %video_id, %user_id, "Failed to finalize video record");
-        cleanup_failed_video_upload(&state.db, video_id, &output_directory).await;
+    .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    let video_id = Uuid::new_v4();
+    let upload_id = Uuid::new_v4();
+    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+    tokio::fs::create_dir_all(&output_directory)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, path = %output_directory.display(), "Failed to create video upload directory");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    let temporary_path = upload_temporary_path(&output_directory, &extension);
+    if let Err(error) = tokio::fs::File::create(&temporary_path).await {
+        tracing::error!(%error, path = %temporary_path.display(), "Failed to initialize resumable video upload");
+        cleanup_video_directory(&output_directory).await;
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    let directory_url = format!("{VIDEO_ASSET_URL}/{video_id}");
+    let title = non_empty(default_video_title(&input.file_name));
+    let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
+    let result = async {
+        sqlx::query(
+            r#"
+            INSERT INTO video (
+                id, user_id, title, cover_url, duration, origin_file_url,
+                hls_master_url, status, visibility, processing_progress
+            )
+            VALUES ($1, $2, $3, $4, 0, $5, $6, 'uploading', 'private', 0)
+            "#,
+        )
+        .bind(video_id)
+        .bind(user_id)
+        .bind(title)
+        .bind(format!("{directory_url}/poster.webp"))
+        .bind(format!("{directory_url}/source.{extension}"))
+        .bind(format!("{directory_url}/master.m3u8"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_db_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO video_upload (
+                id, video_id, user_id, file_extension, total_bytes, uploaded_bytes, status
+            )
+            VALUES ($1, $2, $3, $4, $5, 0, 'uploading')
+            "#,
+        )
+        .bind(upload_id)
+        .bind(video_id)
+        .bind(user_id)
+        .bind(&extension)
+        .bind(input.total_bytes as i64)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal_db_error)?;
+        transaction.commit().await.map_err(internal_db_error)
+    }
+    .await;
+    if let Err(status) = result {
+        cleanup_video_directory(&output_directory).await;
+        return Err(status);
+    }
+
     let video = load_video(&state.db, video_id, Some(user_id)).await?;
-    spawn_video_processing(
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(VideoUploadSession {
+            upload_id,
+            video,
+            chunk_size: VIDEO_UPLOAD_CHUNK_BYTES as u64,
+            uploaded_bytes: 0,
+            total_bytes: input.total_bytes,
+            complete: false,
+        })),
+    ))
+}
+
+pub async fn upload_status(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(upload_id): AxumPath<Uuid>,
+) -> Result<Json<ApiResponse<VideoUploadSession>>, StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    let state_row = load_upload_state(&state.db, upload_id, user_id).await?;
+    let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
+    Ok(Json(ApiResponse::success(upload_session_response(
+        upload_id, video, &state_row,
+    ))))
+}
+
+pub async fn upload_chunk(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(upload_id): AxumPath<Uuid>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ApiResponse<VideoUploadSession>>, StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    let offset = upload_offset(&headers)?;
+    if body.is_empty() || body.len() > VIDEO_UPLOAD_CHUNK_BYTES {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
+    let state_row = sqlx::query_as::<_, UploadStateRow>(
+        r#"
+        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        FROM video_upload
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(upload_id)
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(internal_db_error)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    if state_row.status != "uploading" {
+        return Err(StatusCode::CONFLICT);
+    }
+    let expected_offset = state_row.uploaded_bytes.max(0) as u64;
+    let total_bytes = state_row.total_bytes.max(0) as u64;
+    if offset != expected_offset || offset.saturating_add(body.len() as u64) > total_bytes {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(state_row.video_id.to_string());
+    let temporary_path = upload_temporary_path(&output_directory, &state_row.file_extension);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&temporary_path)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, path = %temporary_path.display(), "Failed to open resumable video upload");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    file.write_all(&body)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    file.flush()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let uploaded_bytes = offset + body.len() as u64;
+    sqlx::query(
+        r#"
+        UPDATE video_upload
+        SET uploaded_bytes = $3, updated_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(upload_id)
+    .bind(user_id)
+    .bind(uploaded_bytes as i64)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_db_error)?;
+    transaction.commit().await.map_err(internal_db_error)?;
+
+    let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
+    Ok(Json(ApiResponse::success(VideoUploadSession {
+        upload_id,
+        video,
+        chunk_size: VIDEO_UPLOAD_CHUNK_BYTES as u64,
+        uploaded_bytes,
+        total_bytes,
+        complete: false,
+    })))
+}
+
+pub async fn complete_upload(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    AxumPath(upload_id): AxumPath<Uuid>,
+) -> Result<(StatusCode, Json<ApiResponse<Video>>), StatusCode> {
+    let user_id = authenticated_user_id(&claims)?;
+    let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
+    let state_row = sqlx::query_as::<_, UploadStateRow>(
+        r#"
+        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        FROM video_upload
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(upload_id)
+    .bind(user_id)
+    .fetch_optional(&mut *transaction)
+    .await
+    .map_err(internal_db_error)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    if state_row.status == "complete" {
+        transaction.rollback().await.map_err(internal_db_error)?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(ApiResponse::success(
+                load_video(&state.db, state_row.video_id, Some(user_id)).await?,
+            )),
+        ));
+    }
+    if state_row.status != "uploading" || state_row.uploaded_bytes != state_row.total_bytes {
+        return Err(StatusCode::CONFLICT);
+    }
+
+    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(state_row.video_id.to_string());
+    let temporary_path = upload_temporary_path(&output_directory, &state_row.file_extension);
+    let final_path = output_directory.join(format!("source.{}", state_row.file_extension));
+    tokio::fs::rename(&temporary_path, &final_path)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to finalize resumable video upload");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    sqlx::query(
+        r#"
+        UPDATE video_upload
+        SET status = 'complete', completed_at = NOW(), updated_at = NOW()
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(upload_id)
+    .bind(user_id)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal_db_error)?;
+    transaction.commit().await.map_err(internal_db_error)?;
+
+    let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
+    spawn_uploaded_video_processing(
         state.db.clone(),
-        video_id,
-        PendingVideo {
-            source_path,
-            output_directory,
-            duration_us: metadata.duration_us,
-        },
+        state_row.video_id,
+        final_path,
+        output_directory,
     );
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(video))))
 }
@@ -1768,6 +1999,107 @@ fn spawn_video_processing(db: PgPool, video_id: Uuid, pending: PendingVideo) {
     });
 }
 
+fn spawn_uploaded_video_processing(
+    db: PgPool,
+    video_id: Uuid,
+    source_path: PathBuf,
+    output_directory: PathBuf,
+) {
+    tokio::spawn(async move {
+        let metadata = match probe_video_metadata(&source_path).await {
+            Ok(metadata) => metadata,
+            Err(status) => {
+                mark_video_processing_failed(
+                    &db,
+                    video_id,
+                    format!("Unable to inspect the uploaded video ({status})."),
+                )
+                .await;
+                return;
+            }
+        };
+        let size = match tokio::fs::metadata(&source_path).await {
+            Ok(metadata) => metadata.len().min(i64::MAX as u64) as i64,
+            Err(error) => {
+                tracing::error!(%error, %video_id, "Failed to read uploaded video metadata");
+                mark_video_processing_failed(
+                    &db,
+                    video_id,
+                    "Unable to read the uploaded video.".to_owned(),
+                )
+                .await;
+                return;
+            }
+        };
+        let updated = sqlx::query(
+            r#"
+            UPDATE video
+            SET duration = $2,
+                width = $3,
+                height = $4,
+                fps = $5::double precision::numeric,
+                size = $6,
+                status = 'processing',
+                processing_progress = 0,
+                processing_error = NULL,
+                updated_at = NOW()
+            WHERE id = $1 AND status = 'uploading'
+            "#,
+        )
+        .bind(video_id)
+        .bind(((metadata.duration_us + 999_999) / 1_000_000) as i32)
+        .bind(metadata.width as i32)
+        .bind(metadata.height as i32)
+        .bind(metadata.fps)
+        .bind(size)
+        .execute(&db)
+        .await;
+
+        match updated {
+            Ok(result) if result.rows_affected() == 1 => {
+                spawn_video_processing(
+                    db,
+                    video_id,
+                    PendingVideo {
+                        source_path,
+                        output_directory,
+                        duration_us: metadata.duration_us,
+                    },
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, %video_id, "Failed to finalize uploaded video");
+                mark_video_processing_failed(
+                    &db,
+                    video_id,
+                    "Unable to prepare the uploaded video.".to_owned(),
+                )
+                .await;
+            }
+        }
+    });
+}
+
+async fn mark_video_processing_failed(db: &PgPool, video_id: Uuid, error: String) {
+    if let Err(db_error) = sqlx::query(
+        r#"
+        UPDATE video
+        SET status = 'failed',
+            processing_error = $2,
+            updated_at = NOW()
+        WHERE id = $1 AND status = 'uploading'
+        "#,
+    )
+    .bind(video_id)
+    .bind(error)
+    .execute(db)
+    .await
+    {
+        tracing::error!(%db_error, %video_id, "Failed to save video upload failure");
+    }
+}
+
 async fn transcode_video_to_hls(
     db: &PgPool,
     video_id: Uuid,
@@ -1780,6 +2112,8 @@ async fn transcode_video_to_hls(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
+    // Publish a usable fallback poster before HLS transcoding so processing cards can render it.
+    generate_video_poster(&ffmpeg, source_path, output_directory, duration_us).await?;
     let playlist_path = output_directory.join("master.m3u8");
     let segment_pattern = output_directory.join("segment-%05d.ts");
     let mut child = Command::new(&ffmpeg)
@@ -1854,7 +2188,7 @@ async fn transcode_video_to_hls(
         );
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    generate_video_poster(&ffmpeg, source_path, output_directory).await
+    Ok(())
 }
 
 async fn update_processing_progress(db: &PgPool, video_id: Uuid, progress: i16) {
@@ -1879,6 +2213,7 @@ async fn generate_video_poster(
     ffmpeg: &str,
     source_path: &FsPath,
     output_directory: &FsPath,
+    duration_us: u64,
 ) -> Result<(), StatusCode> {
     if tokio::fs::try_exists(output_directory.join("cover.webp"))
         .await
@@ -1886,14 +2221,13 @@ async fn generate_video_poster(
     {
         return Ok(());
     }
-    let mut output = extract_video_poster_frame(ffmpeg, source_path, Some("2")).await?;
-    if !output.status.success() || output.stdout.is_empty() {
-        output = extract_video_poster_frame(ffmpeg, source_path, None).await?;
-    }
+    let output = extract_video_poster_frames(ffmpeg, source_path, duration_us).await?;
     if !output.status.success() || output.stdout.is_empty() {
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    let encoded = tokio::task::spawn_blocking(move || encode_cover(&output.stdout))
+    let selected_frame =
+        select_video_poster_frame(&output.stdout).ok_or(StatusCode::UNPROCESSABLE_ENTITY)?;
+    let encoded = tokio::task::spawn_blocking(move || encode_cover(&selected_frame))
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
@@ -1902,24 +2236,28 @@ async fn generate_video_poster(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn extract_video_poster_frame(
+async fn extract_video_poster_frames(
     ffmpeg: &str,
     source_path: &FsPath,
-    seek_seconds: Option<&str>,
+    duration_us: u64,
 ) -> Result<std::process::Output, StatusCode> {
+    let duration_seconds = (duration_us as f64 / 1_000_000.0).max(1.0);
+    let fps = format!(
+        "{}/{}",
+        VIDEO_POSTER_CANDIDATE_COUNT,
+        format!("{duration_seconds:.3}")
+    );
     let mut command = Command::new(ffmpeg);
-    command.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
-    if let Some(seek_seconds) = seek_seconds {
-        command.args(["-ss", seek_seconds]);
-    }
+    command.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"]);
     command
-        .arg("-i")
         .arg(source_path)
         .args([
             "-map",
             "0:v:0",
+            "-vf",
+            &format!("fps={fps},scale='min(640,iw)':-2:flags=lanczos"),
             "-frames:v",
-            "1",
+            &VIDEO_POSTER_CANDIDATE_COUNT.to_string(),
             "-c:v",
             "mjpeg",
             "-q:v",
@@ -1933,10 +2271,89 @@ async fn extract_video_poster_frame(
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
+fn select_video_poster_frame(jpeg_stream: &[u8]) -> Option<Vec<u8>> {
+    let mut candidates = Vec::new();
+    let mut cursor = 0;
+    while let Some(start_offset) = jpeg_stream[cursor..]
+        .windows(2)
+        .position(|window| window == [0xff, 0xd8])
+    {
+        let start = cursor + start_offset;
+        let end_offset = jpeg_stream[start + 2..]
+            .windows(2)
+            .position(|window| window == [0xff, 0xd9])?;
+        let end = start + 2 + end_offset + 2;
+        candidates.push(&jpeg_stream[start..end]);
+        cursor = end;
+    }
+
+    let mut best: Option<(f32, Vec<u8>)> = None;
+    let mut fallback: Option<(f32, Vec<u8>)> = None;
+    for frame in candidates {
+        let Ok(image) = image::load_from_memory(frame) else {
+            continue;
+        };
+        let (score, average_luminance, dark_pixel_ratio) = score_video_poster_frame(&image);
+        if fallback
+            .as_ref()
+            .is_none_or(|(fallback_score, _)| score > *fallback_score)
+        {
+            fallback = Some((score, frame.to_vec()));
+        }
+        let is_black = average_luminance < 0.08 || dark_pixel_ratio > 0.92;
+        if is_black {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _)| score > *best_score)
+        {
+            best = Some((score, frame.to_vec()));
+        }
+    }
+
+    best.or(fallback).map(|(_, frame)| frame)
+}
+
+fn score_video_poster_frame(image: &image::DynamicImage) -> (f32, f32, f32) {
+    let rgb = image.to_rgb8();
+    let mut luminance_sum = 0.0_f32;
+    let mut luminance_square_sum = 0.0_f32;
+    let mut dark_pixels = 0_u64;
+    let mut pixel_count = 0_u64;
+
+    for pixel in rgb.pixels() {
+        let [red, green, blue] = pixel.0;
+        let luminance =
+            (0.2126 * red as f32 + 0.7152 * green as f32 + 0.0722 * blue as f32) / 255.0;
+        luminance_sum += luminance;
+        luminance_square_sum += luminance * luminance;
+        if luminance < 0.08 {
+            dark_pixels += 1;
+        }
+        pixel_count += 1;
+    }
+
+    if pixel_count == 0 {
+        return (0.0, 0.0, 1.0);
+    }
+
+    let average_luminance = luminance_sum / pixel_count as f32;
+    let variance = (luminance_square_sum / pixel_count as f32 - average_luminance.powi(2)).max(0.0);
+    let contrast = variance.sqrt();
+    let dark_pixel_ratio = dark_pixels as f32 / pixel_count as f32;
+
+    // Prefer a normally exposed frame with visible detail over pure black or blown-out frames.
+    let exposure_score = 1.0 - (average_luminance - 0.52).abs() / 0.52;
+    let score = exposure_score.max(0.0) + contrast * 0.75;
+    (score, average_luminance, dark_pixel_ratio)
+}
+
 async fn stream_video_to_file(field: &mut Field<'_>, path: &FsPath) -> Result<(), StatusCode> {
-    let mut file = tokio::fs::File::create(path)
+    let file = tokio::fs::File::create(path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut file = BufWriter::with_capacity(1024 * 1024, file);
     let mut written = 0usize;
     while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
         written = written.saturating_add(chunk.len());
@@ -1954,6 +2371,53 @@ async fn stream_video_to_file(field: &mut Field<'_>, path: &FsPath) -> Result<()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+fn upload_temporary_path(directory: &FsPath, extension: &str) -> PathBuf {
+    directory.join(format!(".source.{extension}.uploading"))
+}
+
+fn upload_offset(headers: &HeaderMap) -> Result<u64, StatusCode> {
+    headers
+        .get("upload-offset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(StatusCode::BAD_REQUEST)
+}
+
+async fn load_upload_state(
+    db: &PgPool,
+    upload_id: Uuid,
+    user_id: Uuid,
+) -> Result<UploadStateRow, StatusCode> {
+    sqlx::query_as::<_, UploadStateRow>(
+        r#"
+        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        FROM video_upload
+        WHERE id = $1 AND user_id = $2
+        "#,
+    )
+    .bind(upload_id)
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(internal_db_error)?
+    .ok_or(StatusCode::NOT_FOUND)
+}
+
+fn upload_session_response(
+    upload_id: Uuid,
+    video: Video,
+    state: &UploadStateRow,
+) -> VideoUploadSession {
+    VideoUploadSession {
+        upload_id,
+        video,
+        chunk_size: VIDEO_UPLOAD_CHUNK_BYTES as u64,
+        uploaded_bytes: state.uploaded_bytes.max(0) as u64,
+        total_bytes: state.total_bytes.max(0) as u64,
+        complete: state.status == "complete",
+    }
+}
+
 async fn read_field_limited(field: &mut Field<'_>, limit: usize) -> Result<Vec<u8>, StatusCode> {
     let mut bytes = Vec::new();
     while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
@@ -1967,7 +2431,11 @@ async fn read_field_limited(field: &mut Field<'_>, limit: usize) -> Result<Vec<u
 
 fn encode_cover(bytes: &[u8]) -> image::ImageResult<Vec<u8>> {
     let image = image::load_from_memory(bytes)?;
-    let resized = image.thumbnail(1920, 1080);
+    let resized = image.resize_to_fill(
+        VIDEO_COVER_WIDTH,
+        VIDEO_COVER_HEIGHT,
+        image::imageops::FilterType::Lanczos3,
+    );
     let mut encoded = Cursor::new(Vec::new());
     resized.write_to(&mut encoded, ImageFormat::WebP)?;
     Ok(encoded.into_inner())
@@ -2189,8 +2657,11 @@ fn view_date_and_ttl(now: DateTime<Utc>) -> Option<(NaiveDate, u64)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_video_title, normalize_category_slugs, parse_frame_rate, parse_video_metadata,
+        default_video_title, encode_cover, normalize_category_slugs, parse_frame_rate,
+        parse_video_metadata,
     };
+    use image::{DynamicImage, GenericImageView, ImageFormat, RgbImage};
+    use std::io::Cursor;
 
     #[test]
     fn parses_video_probe_metadata() {
@@ -2223,5 +2694,19 @@ mod tests {
         );
         assert_eq!(parse_frame_rate("60/1"), Some(60.0));
         assert_eq!(parse_frame_rate("0/0"), None);
+    }
+
+    #[test]
+    fn encodes_video_cover_as_1920_by_1080_webp() {
+        let source = DynamicImage::ImageRgb8(RgbImage::new(900, 1600));
+        let mut input = Cursor::new(Vec::new());
+        source.write_to(&mut input, ImageFormat::Png).unwrap();
+
+        let encoded = encode_cover(&input.into_inner()).unwrap();
+        assert_eq!(image::guess_format(&encoded).unwrap(), ImageFormat::WebP);
+        assert_eq!(
+            image::load_from_memory(&encoded).unwrap().dimensions(),
+            (1920, 1080)
+        );
     }
 }

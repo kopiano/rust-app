@@ -1,5 +1,5 @@
 use axum::http::{
-    HeaderValue, Method,
+    HeaderName, HeaderValue, Method,
     header::{
         ACCEPT, ACCEPT_RANGES, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE,
         USER_AGENT,
@@ -12,12 +12,27 @@ pub fn cors() -> CorsLayer {
         .allow_origin([
             "http://localhost:1420".parse::<HeaderValue>().unwrap(),
             "http://localhost:5173".parse::<HeaderValue>().unwrap(),
+            "http://localhost:5174".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:5173".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:5174".parse::<HeaderValue>().unwrap(),
             "https://www.coulsonzero.shop"
                 .parse::<HeaderValue>()
                 .unwrap(),
         ])
-        .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE, USER_AGENT, RANGE])
-        .expose_headers([ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE])
+        .allow_headers([
+            AUTHORIZATION,
+            ACCEPT,
+            CONTENT_TYPE,
+            USER_AGENT,
+            RANGE,
+            HeaderName::from_static("upload-offset"),
+        ])
+        .expose_headers([
+            ACCEPT_RANGES,
+            CONTENT_LENGTH,
+            CONTENT_RANGE,
+            HeaderName::from_static("upload-offset"),
+        ])
         .allow_credentials(true)
         .allow_methods([
             Method::GET,
