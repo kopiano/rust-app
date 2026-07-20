@@ -3,6 +3,7 @@ pub mod message;
 pub mod moment;
 pub mod music;
 pub mod subscription;
+pub mod system;
 pub mod task;
 pub mod user;
 pub mod video;

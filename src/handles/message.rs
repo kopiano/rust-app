@@ -175,11 +175,23 @@ pub async fn send(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let _ = state.message_tx.send(MessageBroadcast {
+    let event = MessageBroadcast {
         event: "message",
         message: message.clone(),
         recipients,
-    });
+    };
+    match state.message_hub.dispatch(&event).await {
+        Ok(report) if report.dropped > 0 => tracing::warn!(
+            message_id = message.id,
+            delivered = report.delivered,
+            dropped = report.dropped,
+            "Dropped slow message WebSocket connections"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, message_id = message.id, "Failed to serialize message event");
+        }
+    }
 
     Ok(Json(ApiResponse::success(message)))
 }
@@ -391,11 +403,23 @@ pub async fn send_image(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let _ = state.message_tx.send(MessageBroadcast {
+    let event = MessageBroadcast {
         event: "message",
         message: message.clone(),
         recipients,
-    });
+    };
+    match state.message_hub.dispatch(&event).await {
+        Ok(report) if report.dropped > 0 => tracing::warn!(
+            message_id = message.id,
+            delivered = report.delivered,
+            dropped = report.dropped,
+            "Dropped slow image message WebSocket connections"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, message_id = message.id, "Failed to serialize image message event");
+        }
+    }
 
     Ok(Json(ApiResponse::success(message)))
 }
@@ -781,7 +805,8 @@ pub async fn websocket(
 }
 
 async fn websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid) {
-    let mut messages = state.message_tx.subscribe();
+    let (connection_id, mut messages) = state.message_hub.register(user_id).await;
+    tracing::info!(target: "app::ws", %user_id, %connection_id, "Message WebSocket connected");
 
     if let Err(error) = refresh_online_status(&state, user_id).await {
         tracing::error!(%error, %user_id, "Failed to initialize online presence");
@@ -791,17 +816,12 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid
         tokio::select! {
             event = messages.recv() => {
                 match event {
-                    Ok(event) if event.recipients.contains(&user_id) => {
-                        let payload = match serde_json::to_string(&event) {
-                            Ok(payload) => payload,
-                            Err(_) => continue,
-                        };
-                        if socket.send(WsMessage::Text(payload.into())).await.is_err() {
+                    Some(payload) => {
+                        if socket.send(WsMessage::Text(payload.to_string().into())).await.is_err() {
                             break;
                         }
                     }
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    None => break,
                 }
             }
             incoming = socket.recv() => {
@@ -835,6 +855,8 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, user_id: Uuid
             }
         }
     }
+    state.message_hub.unregister(user_id, connection_id).await;
+    tracing::info!(target: "app::ws", %user_id, %connection_id, "Message WebSocket disconnected");
 }
 
 pub async fn user_info(

@@ -199,7 +199,7 @@ pub async fn reconcile_pending_payment_reviewer_notifications(state: &AppState) 
             count = broadcasts.len(),
             "Reconciled missing pending payment notifications"
         );
-        broadcast_messages(state, broadcasts);
+        broadcast_messages(state, broadcasts).await;
     }
 }
 
@@ -361,7 +361,7 @@ pub async fn create_pro_checkout(
         tracing::error!(%error, %order_no, "Failed to commit payment order");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    broadcast_messages(&state, broadcasts);
+    broadcast_messages(&state, broadcasts).await;
 
     Json(ApiResponse::success(CheckoutResponse {
         order_no,
@@ -494,7 +494,7 @@ pub async fn confirm_order(
         tracing::error!(%error, %order_no, "Failed to commit payment confirmation");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    broadcast_messages(&state, vec![(message, vec![system_user_id, order.0])]);
+    broadcast_messages(&state, vec![(message, vec![system_user_id, order.0])]).await;
     Json(ApiResponse::success(serde_json::json!({
         "order_no": order_no,
         "status": "succeeded",
@@ -692,13 +692,26 @@ fn payment_reviewer_content(
     )
 }
 
-fn broadcast_messages(state: &AppState, messages: Vec<(Message, Vec<Uuid>)>) {
+async fn broadcast_messages(state: &AppState, messages: Vec<(Message, Vec<Uuid>)>) {
     for (message, recipients) in messages {
-        let _ = state.message_tx.send(MessageBroadcast {
+        let message_id = message.id;
+        let event = MessageBroadcast {
             event: "message",
             message,
             recipients,
-        });
+        };
+        match state.message_hub.dispatch(&event).await {
+            Ok(report) if report.dropped > 0 => tracing::warn!(
+                %message_id,
+                delivered = report.delivered,
+                dropped = report.dropped,
+                "Dropped slow subscription message WebSocket connections"
+            ),
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, %message_id, "Failed to serialize subscription message event");
+            }
+        }
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::app::AppState;
-use crate::handles::{auth, message, moment, music, subscription, task, user, video};
-use crate::middleware::{cors, jwt, logger, plan};
+use crate::handles::{auth, message, moment, music, subscription, system, task, user, video};
+use crate::middleware::{concurrency, cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -18,6 +18,7 @@ const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
+        .merge(system_api())
         .merge(auth_api())
         .merge(user_api(state.clone()))
         .merge(message_api(state.clone()))
@@ -25,7 +26,11 @@ pub fn create_router(state: AppState) -> Router {
         .merge(music_api(state.clone()))
         .merge(video_api(state.clone()))
         .merge(subscription_api(state.clone()))
-        .merge(task_api(state.clone()));
+        .merge(task_api(state.clone()))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            concurrency::limit_http,
+        ));
 
     Router::new()
         .route("/", get(root))
@@ -95,6 +100,12 @@ fn auth_api() -> Router<AppState> {
     Router::new().merge(public)
 }
 
+fn system_api() -> Router<AppState> {
+    Router::new()
+        .route("/health", get(system::health))
+        .route("/metrics", get(system::metrics))
+}
+
 fn user_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/users", get(user::list).post(user::create))
@@ -105,7 +116,12 @@ fn user_api(state: AppState) -> Router<AppState> {
         .route("/users/me", get(user::me))
         .route(
             "/user/profile",
-            put(user::profile).layer(DefaultBodyLimit::max(7 * 1024 * 1024)),
+            put(user::profile)
+                .layer(DefaultBodyLimit::max(7 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         ) // change info
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
@@ -125,13 +141,23 @@ fn message_api(state: AppState) -> Router<AppState> {
         .route("/message", post(message::send))
         .route(
             "/message/image",
-            post(message::send_image).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+            post(message::send_image)
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         ) // send image, testing
         .route("/message/history", get(message::history)) // chat message history
         .route("/message/user_info", get(message::user_info)) // group and contacts
         .route(
             "/message/group",
-            post(message::create_group).layer(DefaultBodyLimit::max(7 * 1024 * 1024)),
+            post(message::create_group)
+                .layer(DefaultBodyLimit::max(7 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route(
             "/message/group/{id}/members",
@@ -154,7 +180,12 @@ fn moment_api(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route(
             "/moment",
-            post(moment::create).layer(DefaultBodyLimit::max(MAX_MOMENT_BODY_BYTES)),
+            post(moment::create)
+                .layer(DefaultBodyLimit::max(MAX_MOMENT_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route("/moment/{id}", axum::routing::delete(moment::delete))
         .route(
@@ -188,7 +219,12 @@ fn music_api(state: AppState) -> Router<AppState> {
     let private = Router::new()
         .route(
             "/music/upload",
-            post(music::upload).layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES)),
+            post(music::upload)
+                .layer(DefaultBodyLimit::max(MAX_MUSIC_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route("/music/ws", get(music::websocket))
         .route("/music/{id}", axum::routing::delete(music::delete))
@@ -216,7 +252,11 @@ fn video_api(state: AppState) -> Router<AppState> {
         .route(
             "/video/uploads/{upload_id}/chunk",
             put(video::upload_chunk)
-                .layer(DefaultBodyLimit::max(MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES)),
+                .layer(DefaultBodyLimit::max(MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route(
             "/video/uploads/{upload_id}/complete",
@@ -224,13 +264,22 @@ fn video_api(state: AppState) -> Router<AppState> {
         )
         .route(
             "/video/upload",
-            post(video::upload).layer(DefaultBodyLimit::max(MAX_VIDEO_BODY_BYTES)),
+            post(video::upload)
+                .layer(DefaultBodyLimit::max(MAX_VIDEO_BODY_BYTES))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route(
             "/video/{id}",
             patch(video::update)
                 .delete(video::delete)
-                .layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+                .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
         )
         .route("/video/{id}/like", post(video::like).delete(video::unlike))
         .route(

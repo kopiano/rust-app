@@ -13,6 +13,9 @@ run:
 	@sqlx migrate run
 	@cargo run
 
+load-test:
+	@bash scripts/load-test.sh
+
 kill:
 	@pids=$$(lsof -t -i :8100); \
 	if [ -n "$$pids" ]; then \

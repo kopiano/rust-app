@@ -11,6 +11,7 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use rand::{Rng, distr::Alphanumeric};
 use redis::AsyncCommands;
 use serde::Deserialize;
+use std::sync::atomic::Ordering;
 
 use crate::app::AppState;
 use crate::common::response::ApiResponse;
@@ -36,10 +37,7 @@ pub async fn register(
         return Err(StatusCode::BAD_REQUEST);
     }
     let password = input.password.clone();
-    let hash = tokio::task::spawn_blocking(move || bcrypt::hash(password, BCRYPT_COST))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let hash = run_bcrypt(&state, move || bcrypt::hash(password, BCRYPT_COST)).await?;
     let user = sqlx::query_as::<_, User>(
         r##"INSERT INTO "user" (name, email, password_hash, last_login_at)
          VALUES ($1, $2, $3, NOW())
@@ -104,10 +102,7 @@ pub async fn login(
         .map(|user| user.password_hash.clone())
         .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_owned());
     let password = input.password.clone();
-    let valid = tokio::task::spawn_blocking(move || bcrypt::verify(password, &password_hash))
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let valid = run_bcrypt(&state, move || bcrypt::verify(password, &password_hash)).await?;
     let user = match (user, valid) {
         (Some(user), true) => user,
         _ => {
@@ -139,6 +134,35 @@ pub async fn login(
         },
         token,
     ))
+}
+
+async fn run_bcrypt<T, F>(state: &AppState, operation: F) -> Result<T, StatusCode>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, bcrypt::BcryptError> + Send + 'static,
+{
+    let permit = tokio::time::timeout(
+        state.limits.bcrypt_queue_timeout,
+        state.limits.bcrypt.clone().acquire_owned(),
+    )
+    .await;
+    let _permit = match permit {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) | Err(_) => {
+            state
+                .metrics
+                .bcrypt_rejected
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+
+    state.metrics.bcrypt_active.fetch_add(1, Ordering::Relaxed);
+    let result = tokio::task::spawn_blocking(operation).await;
+    state.metrics.bcrypt_active.fetch_sub(1, Ordering::Relaxed);
+    result
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn is_local_environment() -> bool {

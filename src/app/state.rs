@@ -1,8 +1,13 @@
 use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
-use crate::models::{message::MessageBroadcast, music::MusicProcessingBroadcast};
+use crate::{
+    app::runtime::{AppMetrics, RuntimeLimits},
+    models::music::MusicProcessingBroadcast,
+    services::message_hub::MessageHub,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,6 +23,8 @@ pub struct AppState {
     #[allow(dead_code)]
     pub pro_checkout_url: Option<String>,
     pub subscription_webhook_secret: Option<String>,
-    pub message_tx: broadcast::Sender<MessageBroadcast>,
+    pub message_hub: Arc<MessageHub>,
     pub music_tx: broadcast::Sender<MusicProcessingBroadcast>,
+    pub limits: Arc<RuntimeLimits>,
+    pub metrics: Arc<AppMetrics>,
 }

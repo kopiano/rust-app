@@ -39,7 +39,6 @@ const MUSIC_DIRECTORY: &str = "src/assets/music";
 const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 const AAC_BITRATE: &str = "256k";
 const ALLOWED_EXTENSIONS: &[&str] = &["mp3", "m4a", "aac", "flac", "wav", "ogg", "opus", "ncm"];
-static AUDIO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Debug, Deserialize)]
 struct ProbeOutput {
@@ -812,7 +811,13 @@ pub async fn upload(
     }
 
     for upload in uploads {
-        spawn_music_processing(state.db.clone(), state.music_tx.clone(), user_id, upload);
+        spawn_music_processing(
+            state.db.clone(),
+            state.music_tx.clone(),
+            state.limits.transcode.clone(),
+            user_id,
+            upload,
+        );
     }
 
     Ok((StatusCode::CREATED, Json(ApiResponse::success(created))).into_response())
@@ -1264,10 +1269,6 @@ async fn probe_audio(path: &Path) -> Result<ProbeOutput, StatusCode> {
 }
 
 async fn transcode_to_aac(source: &Path, output: &Path) -> Result<(), StatusCode> {
-    let _permit = AUDIO_TRANSCODE_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
     let result = Command::new(&ffmpeg)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
@@ -1571,10 +1572,25 @@ async fn create_cover(source: &Path, output: &Path, id: Uuid) -> Result<CoverOut
 fn spawn_music_processing(
     db: sqlx::PgPool,
     music_tx: tokio::sync::broadcast::Sender<MusicProcessingBroadcast>,
+    transcode_slots: Arc<Semaphore>,
     user_id: Uuid,
     music: MusicUpload,
 ) {
     tokio::spawn(async move {
+        let _permit = match transcode_slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                mark_music_processing_failed(
+                    &db,
+                    &music_tx,
+                    user_id,
+                    music.id,
+                    "Media processing is unavailable",
+                )
+                .await;
+                return;
+            }
+        };
         let started_at = Instant::now();
         let original_path = music
             .directory

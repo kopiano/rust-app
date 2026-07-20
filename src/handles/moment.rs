@@ -3,6 +3,7 @@ use std::{
     io::Cursor,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use axum::{
@@ -42,7 +43,6 @@ const MAX_MOMENT_PAGE_SIZE: i64 = 50;
 const HLS_SEGMENT_SECONDS: &str = "6";
 const MOMENT_VIEW_UTC_OFFSET_HOURS: i64 = 8;
 const MOMENT_VISITOR_COOKIE: &str = "visitor_id";
-static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 struct PendingVideo {
     source_path: PathBuf,
@@ -221,7 +221,12 @@ pub async fn create(
     };
 
     let response_status = if let Some(pending) = pending_video {
-        spawn_video_processing(state.db.clone(), moment.id, pending);
+        spawn_video_processing(
+            state.db.clone(),
+            state.limits.transcode.clone(),
+            moment.id,
+            pending,
+        );
         StatusCode::ACCEPTED
     } else {
         StatusCode::CREATED
@@ -925,8 +930,20 @@ fn parse_video_metadata(output: &[u8]) -> Option<(u32, u32, u64)> {
     }
 }
 
-fn spawn_video_processing(db: sqlx::PgPool, moment_id: Uuid, pending: PendingVideo) {
+fn spawn_video_processing(
+    db: sqlx::PgPool,
+    transcode_slots: Arc<Semaphore>,
+    moment_id: Uuid,
+    pending: PendingVideo,
+) {
     tokio::spawn(async move {
+        let _permit = match transcode_slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::error!(%moment_id, "Moment media processing is unavailable");
+                return;
+            }
+        };
         let result = transcode_video_to_hls(
             &db,
             moment_id,
@@ -981,10 +998,6 @@ async fn transcode_video_to_hls(
     output_directory: &Path,
     duration_us: u64,
 ) -> Result<(), StatusCode> {
-    let _permit = VIDEO_TRANSCODE_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
     let playlist_path = output_directory.join("index.m3u8");
     let segment_pattern = output_directory.join("segment-%05d.ts");

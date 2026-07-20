@@ -9,6 +9,7 @@ mod services;
 
 use crate::config::{jwt, logger};
 use crate::database::{postgres, redis};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -28,8 +29,19 @@ async fn main() {
         .expect("Database migration failed");
     let redis = redis::connect().await;
     tracing::info!(target: "app::redis", "Redis connected");
-    let (message_tx, _) = tokio::sync::broadcast::channel(256);
     let (music_tx, _) = tokio::sync::broadcast::channel(256);
+    let limits = Arc::new(app::runtime::RuntimeLimits::from_env());
+    let metrics = Arc::new(app::runtime::AppMetrics::default());
+    let message_hub = Arc::new(services::message_hub::MessageHub::from_env());
+    tracing::info!(
+        target: "app::limits",
+        http = limits.http_max,
+        upload = limits.upload_max,
+        bcrypt = limits.bcrypt_max,
+        transcode = limits.transcode_max,
+        websocket_queue = message_hub.queue_capacity(),
+        "Runtime concurrency limits configured"
+    );
     // state
     let state = app::AppState {
         db: pool,
@@ -49,8 +61,10 @@ async fn main() {
         subscription_webhook_secret: std::env::var("SUBSCRIPTION_WEBHOOK_SECRET")
             .ok()
             .filter(|value| !value.trim().is_empty()),
-        message_tx,
+        message_hub,
         music_tx,
+        limits,
+        metrics,
     };
     handles::subscription::reconcile_pending_payment_reviewer_notifications(&state).await;
 

@@ -2,6 +2,7 @@ use std::{
     io::{Cursor, SeekFrom},
     path::{Path as FsPath, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 
 use axum::{
@@ -54,7 +55,6 @@ const VIDEO_COVER_HEIGHT: u32 = 1080;
 const VIDEO_POSTER_CANDIDATE_COUNT: u32 = 12;
 const VIDEO_VIEW_UTC_OFFSET_HOURS: i64 = 8;
 const VIDEO_VISITOR_COOKIE: &str = "video_visitor_id";
-static VIDEO_TRANSCODE_SLOTS: Semaphore = Semaphore::const_new(2);
 
 #[derive(Default, Deserialize)]
 pub struct VideoListQuery {
@@ -509,7 +509,13 @@ pub async fn upload(
         return Err(StatusCode::BAD_REQUEST);
     };
     let video = load_video(&state.db, video_id, Some(user_id)).await?;
-    spawn_uploaded_video_processing(state.db.clone(), video_id, source_path, output_directory);
+    spawn_uploaded_video_processing(
+        state.db.clone(),
+        state.limits.transcode.clone(),
+        video_id,
+        source_path,
+        output_directory,
+    );
     Ok((StatusCode::ACCEPTED, Json(ApiResponse::success(video))))
 }
 
@@ -774,6 +780,7 @@ pub async fn complete_upload(
     let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
     spawn_uploaded_video_processing(
         state.db.clone(),
+        state.limits.transcode.clone(),
         state_row.video_id,
         final_path,
         output_directory,
@@ -1008,7 +1015,12 @@ pub async fn update(
     transaction.commit().await.map_err(internal_db_error)?;
     if let Some(pending) = retry_pending {
         cleanup_transcoded_video_files(&pending.output_directory).await;
-        spawn_video_processing(state.db.clone(), video_id, pending);
+        spawn_video_processing(
+            state.db.clone(),
+            state.limits.transcode.clone(),
+            video_id,
+            pending,
+        );
     }
 
     Ok(Json(ApiResponse::success(
@@ -2076,8 +2088,20 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
         .filter(|fps| fps.is_finite() && *fps > 0.0)
 }
 
-fn spawn_video_processing(db: PgPool, video_id: Uuid, pending: PendingVideo) {
+fn spawn_video_processing(
+    db: PgPool,
+    transcode_slots: Arc<Semaphore>,
+    video_id: Uuid,
+    pending: PendingVideo,
+) {
     tokio::spawn(async move {
+        let _permit = match transcode_slots.acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                tracing::error!(%video_id, "Video media processing is unavailable");
+                return;
+            }
+        };
         let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
         if let Err(status) = generate_video_poster(
             &ffmpeg,
@@ -2134,6 +2158,7 @@ fn spawn_video_processing(db: PgPool, video_id: Uuid, pending: PendingVideo) {
 
 fn spawn_uploaded_video_processing(
     db: PgPool,
+    transcode_slots: Arc<Semaphore>,
     video_id: Uuid,
     source_path: PathBuf,
     output_directory: PathBuf,
@@ -2201,6 +2226,7 @@ fn spawn_uploaded_video_processing(
                 tracing::info!(%video_id, "Uploaded video marked as processing");
                 spawn_video_processing(
                     db,
+                    transcode_slots,
                     video_id,
                     PendingVideo {
                         source_path,
@@ -2255,10 +2281,6 @@ async fn transcode_video_to_hls(
     duration_us: u64,
 ) -> Result<(), StatusCode> {
     tracing::info!(%video_id, "Video processing queued for transcode slot");
-    let _permit = VIDEO_TRANSCODE_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     tracing::info!(%video_id, "Video processing acquired transcode slot");
     let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
     let playlist_path = output_directory.join("master.m3u8");

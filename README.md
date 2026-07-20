@@ -139,6 +139,39 @@ git restore --staged .
 
 
 ## 接口性能优化
+### 并发与背压
+
+服务默认使用以下并发限制，可通过 `.env` 调整：
+
+```text
+HTTP_CONCURRENCY=128
+UPLOAD_CONCURRENCY=4
+BCRYPT_CONCURRENCY=4
+TRANSCODE_CONCURRENCY=2
+WS_CONNECTION_QUEUE_CAPACITY=64
+DB_MAX_CONNECTIONS=20
+DB_ACQUIRE_TIMEOUT_MS=2000
+```
+
+运行状态：
+
+```shell
+curl http://127.0.0.1:8100/api/health
+curl http://127.0.0.1:8100/api/metrics
+```
+
+安装 `hey` 后运行基础压测：
+
+```shell
+brew install hey
+make load-test
+
+CONCURRENCY=128 REQUESTS=10000 TARGET_PATH=/api/health make load-test
+```
+
+压测时关注 P95/P99 延迟、`http.rejected`、数据库连接池占用和 WebSocket
+慢连接丢弃数量。逐级测试 `32`、`64`、`128` 并发，不要直接将生产限制调到压测峰值。
+
 ### login
 * bcrypt校验耗时严重，降低cost。
 ```rust
@@ -181,4 +214,3 @@ let is_valid = tokio::task::spawn_blocking(move || {
 2026-07-16 18:32:12  Warn     POST          /api/login                     401      18 ms   user_id=1001
 2026-07-16 18:34:29  Error    GET           /api/music                     500       2 ms                    Database timeout
 ```
-
