@@ -29,7 +29,7 @@ use crate::{
     app::AppState,
     common::assets::asset_directory_name,
     common::response::ApiResponse,
-    middleware::jwt::Claims,
+    middleware::{jwt::Claims, plan::has_library_access},
     models::video::{
         CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
         VideoCollection, VideoComment, VideoCommentLikeState, VideoListPage, VideoReactionState,
@@ -39,6 +39,7 @@ use crate::{
 
 const VIDEO_ASSET_ROOT: &str = "src/assets/video";
 const VIDEO_ASSET_URL: &str = "/api/assets/video";
+const MAX_FREE_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 6 * 1024 * 1024 * 1024;
 const VIDEO_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
@@ -424,6 +425,7 @@ pub async fn upload(
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ApiResponse<Video>>), StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
+    let max_upload_bytes = max_video_upload_bytes(&state.db, user_id).await?;
     let video_id = Uuid::new_v4();
     let username = load_username(&state.db, user_id).await?;
     let asset_directory = asset_directory_name(&username, video_id);
@@ -484,7 +486,9 @@ pub async fn upload(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
         upload_record_created = true;
-        if let Err(status) = stream_video_to_file(&mut field, &temporary_path).await {
+        if let Err(status) =
+            stream_video_to_file(&mut field, &temporary_path, max_upload_bytes).await
+        {
             cleanup_failed_video_upload(&state.db, video_id, &output_directory).await;
             return Err(status);
         }
@@ -515,7 +519,8 @@ pub async fn create_upload(
     Json(input): Json<CreateVideoUpload>,
 ) -> Result<(StatusCode, Json<ApiResponse<VideoUploadSession>>), StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    if input.total_bytes == 0 || input.total_bytes > MAX_VIDEO_BYTES as u64 {
+    let max_upload_bytes = max_video_upload_bytes(&state.db, user_id).await?;
+    if input.total_bytes == 0 || input.total_bytes > max_upload_bytes as u64 {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
@@ -2505,7 +2510,11 @@ fn score_video_poster_frame(image: &image::DynamicImage) -> (f32, f32, f32) {
     (score, average_luminance, dark_pixel_ratio)
 }
 
-async fn stream_video_to_file(field: &mut Field<'_>, path: &FsPath) -> Result<(), StatusCode> {
+async fn stream_video_to_file(
+    field: &mut Field<'_>,
+    path: &FsPath,
+    max_bytes: usize,
+) -> Result<(), StatusCode> {
     let file = tokio::fs::File::create(path)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2513,7 +2522,7 @@ async fn stream_video_to_file(field: &mut Field<'_>, path: &FsPath) -> Result<()
     let mut written = 0usize;
     while let Some(chunk) = field.chunk().await.map_err(|_| StatusCode::BAD_REQUEST)? {
         written = written.saturating_add(chunk.len());
-        if written > MAX_VIDEO_BYTES {
+        if written > max_bytes {
             drop(file);
             let _ = tokio::fs::remove_file(path).await;
             return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -2525,6 +2534,25 @@ async fn stream_video_to_file(field: &mut Field<'_>, path: &FsPath) -> Result<()
     file.flush()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn max_video_upload_bytes(db: &PgPool, user_id: Uuid) -> Result<usize, StatusCode> {
+    let subscription = sqlx::query_as::<_, (String, String, Option<DateTime<Utc>>)>(
+        r#"SELECT plan, subscription_status, subscription_end_at FROM "user" WHERE id = $1"#,
+    )
+    .bind(user_id)
+    .fetch_optional(db)
+    .await
+    .map_err(internal_db_error)?
+    .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    Ok(
+        if has_library_access(&subscription.0, &subscription.1, subscription.2) {
+            MAX_VIDEO_BYTES
+        } else {
+            MAX_FREE_VIDEO_BYTES
+        },
+    )
 }
 
 fn upload_temporary_path(directory: &FsPath, extension: &str) -> PathBuf {
