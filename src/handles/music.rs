@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
+    common::assets::asset_directory_name,
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::music::{
@@ -84,6 +85,7 @@ enum CoverOutcome {
 #[derive(Clone)]
 struct MusicUpload {
     id: Uuid,
+    asset_directory: String,
     directory: PathBuf,
     title: String,
     original_url: String,
@@ -691,6 +693,15 @@ pub async fn upload(
     mut multipart: Multipart,
 ) -> Result<Response, Response> {
     let user_id = authenticated_user_id(&claims).map_err(IntoResponse::into_response)?;
+    let username = sqlx::query_scalar::<_, String>(r#"SELECT name FROM "user" WHERE id = $1"#)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %user_id, "Failed to load music uploader");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+        .ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
     let mut uploads = Vec::new();
     let mut found_file = false;
     let mut allow_similar = false;
@@ -719,7 +730,7 @@ pub async fn upload(
         }
         found_file = true;
 
-        match prepare_upload(&mut field).await {
+        match prepare_upload(&mut field, &username).await {
             Ok(upload) => uploads.push(upload),
             Err(status) => {
                 cleanup_uploads(&uploads).await;
@@ -880,11 +891,11 @@ pub async fn delete(
     AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<ApiResponse<()>>, StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let deleted_id = sqlx::query_scalar::<_, Uuid>(
+    let deleted = sqlx::query_as::<_, (Uuid, Option<String>)>(
         r#"
         DELETE FROM music
         WHERE id = $1 AND user_id = $2
-        RETURNING id
+        RETURNING id, asset_directory
         "#,
     )
     .bind(id)
@@ -897,7 +908,8 @@ pub async fn delete(
     })?
     .ok_or(StatusCode::NOT_FOUND)?;
 
-    let directory = PathBuf::from(MUSIC_DIRECTORY).join(deleted_id.to_string());
+    let (deleted_id, asset_directory) = deleted;
+    let directory = music_directory(deleted_id, asset_directory.as_deref());
     match tokio::fs::remove_dir_all(&directory).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -924,7 +936,17 @@ fn authenticated_user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, UploadPreparationError> {
+fn music_directory(id: Uuid, asset_directory: Option<&str>) -> PathBuf {
+    let directory = asset_directory
+        .map(str::to_owned)
+        .unwrap_or_else(|| id.to_string());
+    PathBuf::from(MUSIC_DIRECTORY).join(directory)
+}
+
+async fn prepare_upload(
+    field: &mut Field<'_>,
+    username: &str,
+) -> Result<MusicUpload, UploadPreparationError> {
     let original_name = field
         .file_name()
         .map(str::to_owned)
@@ -939,7 +961,8 @@ async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, UploadPrep
         })?
         .to_owned();
     let id = Uuid::new_v4();
-    let directory = PathBuf::from(MUSIC_DIRECTORY).join(id.to_string());
+    let asset_directory = asset_directory_name(username, id);
+    let directory = PathBuf::from(MUSIC_DIRECTORY).join(&asset_directory);
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| {
@@ -957,10 +980,11 @@ async fn prepare_upload(field: &mut Field<'_>) -> Result<MusicUpload, UploadPrep
             .map_err(upload_preparation_error)?;
         let fallback_title = filename_title(&original_name);
 
-        let base_url = format!("/api/assets/music/{id}");
+        let base_url = format!("/api/assets/music/{asset_directory}");
         let original_url = format!("{base_url}/original.{original_format}");
         let mut upload = MusicUpload {
             id,
+            asset_directory: asset_directory.clone(),
             directory: directory.clone(),
             title: fallback_title.clone(),
             original_url,
@@ -1129,11 +1153,12 @@ async fn insert_processing_music(
         INSERT INTO music (
             id, user_id, title, artist, album, duration_ms, bitrate,
             sample_rate, cover_url, audio_url, original_url, format,
-            original_format, size, original_size, processing_status, file_hash
+            original_format, size, original_size, processing_status, file_hash,
+            asset_directory
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
-            '', '', $9, $10, $10, 0, $11, 'processing', $12
+            '', '', $9, $10, $10, 0, $11, 'processing', $12, $13
         )
         RETURNING id, title, artist, album, duration_ms, bitrate, sample_rate,
                   cover_url, audio_url, original_url, format, original_format,
@@ -1153,6 +1178,7 @@ async fn insert_processing_music(
     .bind(&music.original_format)
     .bind(music.original_size)
     .bind(&music.file_hash)
+    .bind(&music.asset_directory)
     .fetch_one(&mut **transaction)
     .await
     .map_err(|error| {
@@ -1659,12 +1685,15 @@ fn spawn_music_processing(
         .bind(output_metadata.duration_ms.max(source_metadata.duration_ms))
         .bind(output_metadata.bitrate)
         .bind(output_metadata.sample_rate)
-        .bind(format!("/api/assets/music/{}/audio.m4a", music.id))
+        .bind(format!(
+            "/api/assets/music/{}/audio.m4a",
+            music.asset_directory
+        ))
         .bind(output_size)
         .bind(cover_ready)
         .bind(format!(
             "/api/assets/music/{}/cover-processed.webp",
-            music.id
+            music.asset_directory
         ))
         .bind(user_id)
         .fetch_optional(&db)

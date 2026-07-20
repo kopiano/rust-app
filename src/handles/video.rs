@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::{
     app::AppState,
+    common::assets::asset_directory_name,
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::video::{
@@ -130,6 +131,7 @@ pub struct CreateVideoUpload {
 #[derive(sqlx::FromRow)]
 struct UploadStateRow {
     video_id: Uuid,
+    asset_directory: Option<String>,
     file_extension: String,
     total_bytes: i64,
     uploaded_bytes: i64,
@@ -423,7 +425,9 @@ pub async fn upload(
 ) -> Result<(StatusCode, Json<ApiResponse<Video>>), StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
     let video_id = Uuid::new_v4();
-    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+    let username = load_username(&state.db, user_id).await?;
+    let asset_directory = asset_directory_name(&username, video_id);
+    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(&asset_directory);
     tokio::fs::create_dir_all(&output_directory)
         .await
         .map_err(|error| {
@@ -455,14 +459,14 @@ pub async fn upload(
             .filter(|value| !value.is_empty());
         let final_path = output_directory.join(format!("source.{extension}"));
         let temporary_path = output_directory.join(format!(".source.{extension}.uploading"));
-        let directory_url = format!("{VIDEO_ASSET_URL}/{video_id}");
+        let directory_url = format!("{VIDEO_ASSET_URL}/{asset_directory}");
         let inserted = sqlx::query(
             r#"
             INSERT INTO video (
                 id, user_id, title, cover_url, duration, origin_file_url,
-                hls_master_url, status, visibility, processing_progress
+                hls_master_url, status, visibility, processing_progress, asset_directory
             )
-            VALUES ($1, $2, $3, $4, 0, $5, $6, 'uploading', 'private', 0)
+            VALUES ($1, $2, $3, $4, 0, $5, $6, 'uploading', 'private', 0, $7)
             "#,
         )
         .bind(video_id)
@@ -471,6 +475,7 @@ pub async fn upload(
         .bind(format!("{directory_url}/poster.webp"))
         .bind(format!("{directory_url}/source.{extension}"))
         .bind(format!("{directory_url}/master.m3u8"))
+        .bind(&asset_directory)
         .execute(&state.db)
         .await;
         if let Err(error) = inserted {
@@ -521,7 +526,9 @@ pub async fn create_upload(
     .ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
     let video_id = Uuid::new_v4();
     let upload_id = Uuid::new_v4();
-    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+    let username = load_username(&state.db, user_id).await?;
+    let asset_directory = asset_directory_name(&username, video_id);
+    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(&asset_directory);
     tokio::fs::create_dir_all(&output_directory)
         .await
         .map_err(|error| {
@@ -536,7 +543,7 @@ pub async fn create_upload(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    let directory_url = format!("{VIDEO_ASSET_URL}/{video_id}");
+    let directory_url = format!("{VIDEO_ASSET_URL}/{asset_directory}");
     let title = non_empty(default_video_title(&input.file_name));
     let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
     let result = async {
@@ -544,9 +551,9 @@ pub async fn create_upload(
             r#"
             INSERT INTO video (
                 id, user_id, title, cover_url, duration, origin_file_url,
-                hls_master_url, status, visibility, processing_progress
+                hls_master_url, status, visibility, processing_progress, asset_directory
             )
-            VALUES ($1, $2, $3, $4, 0, $5, $6, 'uploading', 'private', 0)
+            VALUES ($1, $2, $3, $4, 0, $5, $6, 'uploading', 'private', 0, $7)
             "#,
         )
         .bind(video_id)
@@ -555,6 +562,7 @@ pub async fn create_upload(
         .bind(format!("{directory_url}/poster.webp"))
         .bind(format!("{directory_url}/source.{extension}"))
         .bind(format!("{directory_url}/master.m3u8"))
+        .bind(&asset_directory)
         .execute(&mut *transaction)
         .await
         .map_err(internal_db_error)?;
@@ -625,10 +633,13 @@ pub async fn upload_chunk(
     let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
     let state_row = sqlx::query_as::<_, UploadStateRow>(
         r#"
-        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        SELECT video_upload.video_id, video.asset_directory,
+               video_upload.file_extension, video_upload.total_bytes,
+               video_upload.uploaded_bytes, video_upload.status
         FROM video_upload
-        WHERE id = $1 AND user_id = $2
-        FOR UPDATE
+        INNER JOIN video ON video.id = video_upload.video_id
+        WHERE video_upload.id = $1 AND video_upload.user_id = $2
+        FOR UPDATE OF video_upload
         "#,
     )
     .bind(upload_id)
@@ -646,7 +657,8 @@ pub async fn upload_chunk(
         return Err(StatusCode::CONFLICT);
     }
 
-    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(state_row.video_id.to_string());
+    let output_directory =
+        video_directory(state_row.video_id, state_row.asset_directory.as_deref());
     let temporary_path = upload_temporary_path(&output_directory, &state_row.file_extension);
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
@@ -702,10 +714,13 @@ pub async fn complete_upload(
     let mut transaction = state.db.begin().await.map_err(internal_db_error)?;
     let state_row = sqlx::query_as::<_, UploadStateRow>(
         r#"
-        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        SELECT video_upload.video_id, video.asset_directory,
+               video_upload.file_extension, video_upload.total_bytes,
+               video_upload.uploaded_bytes, video_upload.status
         FROM video_upload
-        WHERE id = $1 AND user_id = $2
-        FOR UPDATE
+        INNER JOIN video ON video.id = video_upload.video_id
+        WHERE video_upload.id = $1 AND video_upload.user_id = $2
+        FOR UPDATE OF video_upload
         "#,
     )
     .bind(upload_id)
@@ -727,7 +742,8 @@ pub async fn complete_upload(
         return Err(StatusCode::CONFLICT);
     }
 
-    let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(state_row.video_id.to_string());
+    let output_directory =
+        video_directory(state_row.video_id, state_row.asset_directory.as_deref());
     let temporary_path = upload_temporary_path(&output_directory, &state_row.file_extension);
     let final_path = output_directory.join(format!("source.{}", state_row.file_extension));
     tokio::fs::rename(&temporary_path, &final_path)
@@ -740,7 +756,7 @@ pub async fn complete_upload(
         r#"
         UPDATE video_upload
         SET status = 'complete', completed_at = NOW(), updated_at = NOW()
-        WHERE id = $1 AND user_id = $2
+        WHERE video_upload.id = $1 AND video_upload.user_id = $2
         "#,
     )
     .bind(upload_id)
@@ -881,7 +897,16 @@ pub async fn update(
         false
     };
     let retry_pending = if restart_processing {
-        let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+        let asset_directory = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT asset_directory FROM video WHERE id = $1 AND user_id = $2",
+        )
+        .bind(video_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal_db_error)?
+        .flatten();
+        let output_directory = video_directory(video_id, asset_directory.as_deref());
         Some(PendingVideo {
             source_path: source_path_for_video(&output_directory).await?,
             duration_us: video_duration_us(&state.db, video_id).await?,
@@ -899,7 +924,16 @@ pub async fn update(
                 tracing::warn!(%error, %video_id, "Unsupported video cover image");
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             })?;
-        let directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+        let asset_directory = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT asset_directory FROM video WHERE id = $1 AND user_id = $2",
+        )
+        .bind(video_id)
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(internal_db_error)?
+        .flatten();
+        let directory = video_directory(video_id, asset_directory.as_deref());
         tokio::fs::create_dir_all(&directory)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -910,7 +944,13 @@ pub async fn update(
         tokio::fs::rename(&temporary_path, directory.join("cover.webp"))
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Some(format!("{VIDEO_ASSET_URL}/{video_id}/cover.webp"))
+        Some(format!(
+            "{VIDEO_ASSET_URL}/{}/cover.webp",
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+        ))
     } else {
         None
     };
@@ -977,16 +1017,16 @@ pub async fn delete(
     AxumPath(video_id): AxumPath<Uuid>,
 ) -> Result<Json<ApiResponse<()>>, StatusCode> {
     let user_id = authenticated_user_id(&claims)?;
-    let result = sqlx::query("DELETE FROM video WHERE id = $1 AND user_id = $2")
-        .bind(video_id)
-        .bind(user_id)
-        .execute(&state.db)
-        .await
-        .map_err(internal_db_error)?;
-    if result.rows_affected() == 0 {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let directory = FsPath::new(VIDEO_ASSET_ROOT).join(video_id.to_string());
+    let deleted = sqlx::query_as::<_, (Uuid, Option<String>)>(
+        "DELETE FROM video WHERE id = $1 AND user_id = $2 RETURNING id, asset_directory",
+    )
+    .bind(video_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(internal_db_error)?;
+    let (deleted_id, asset_directory) = deleted.ok_or(StatusCode::NOT_FOUND)?;
+    let directory = video_directory(deleted_id, asset_directory.as_deref());
     tokio::spawn(async move {
         cleanup_video_directory(&directory).await;
     });
@@ -1219,44 +1259,13 @@ pub async fn view(
             jar.add(build_visitor_cookie(&state, &headers, visitor_id)),
         )
     };
-    let (viewer_kind, viewer_id) = match (user_id, visitor_id) {
-        (Some(id), None) => ("user", id),
-        (None, Some(id)) => ("visitor", id),
-        _ => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-    };
-    let (view_date, ttl_seconds) =
-        view_date_and_ttl(Utc::now()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let dedup_key = format!("video:view:{video_id}:{viewer_kind}:{viewer_id}:{view_date}");
-    let mut redis = state.redis.clone();
-    let acquired = redis::cmd("SET")
-        .arg(&dedup_key)
-        .arg("1")
-        .arg("NX")
-        .arg("EX")
-        .arg(ttl_seconds)
-        .query_async::<Option<String>>(&mut redis)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, %video_id, "Failed to deduplicate video view");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?
-        .is_some();
-
-    if !acquired {
-        return Ok((
-            jar,
-            Json(ApiResponse::success(
-                load_view_state(&state.db, video_id, false).await?,
-            )),
-        ));
-    }
+    let (view_date, _) = view_date_and_ttl(Utc::now()).ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let result = sqlx::query_as::<_, VideoViewState>(
         r#"
         WITH inserted AS (
             INSERT INTO video_view (video_id, user_id, visitor_id, viewed_on)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT DO NOTHING
             RETURNING video_id
         ),
         updated AS (
@@ -1269,12 +1278,6 @@ pub async fn view(
         SELECT updated.id AS video_id, TRUE AS counted,
                updated.view_count AS view_count
         FROM updated
-        UNION ALL
-        SELECT video.id AS video_id, FALSE AS counted,
-               video.view_count AS view_count
-        FROM video
-        WHERE video.id = $1
-          AND NOT EXISTS (SELECT 1 FROM updated)
         "#,
     )
     .bind(video_id)
@@ -1286,18 +1289,8 @@ pub async fn view(
 
     match result {
         Ok(Some(value)) => Ok((jar, Json(ApiResponse::success(value)))),
-        Ok(None) => {
-            let _: Result<i64, _> = redis::cmd("DEL")
-                .arg(&dedup_key)
-                .query_async(&mut redis)
-                .await;
-            Err(StatusCode::NOT_FOUND)
-        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(error) => {
-            let _: Result<i64, _> = redis::cmd("DEL")
-                .arg(&dedup_key)
-                .query_async(&mut redis)
-                .await;
             tracing::error!(%error, %video_id, "Failed to count video view");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
@@ -2539,6 +2532,22 @@ fn upload_offset(headers: &HeaderMap) -> Result<u64, StatusCode> {
         .ok_or(StatusCode::BAD_REQUEST)
 }
 
+async fn load_username(db: &PgPool, user_id: Uuid) -> Result<String, StatusCode> {
+    sqlx::query_scalar::<_, String>(r#"SELECT name FROM "user" WHERE id = $1"#)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(internal_db_error)?
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
+fn video_directory(id: Uuid, asset_directory: Option<&str>) -> PathBuf {
+    let directory = asset_directory
+        .map(str::to_owned)
+        .unwrap_or_else(|| id.to_string());
+    FsPath::new(VIDEO_ASSET_ROOT).join(directory)
+}
+
 async fn load_upload_state(
     db: &PgPool,
     upload_id: Uuid,
@@ -2546,8 +2555,11 @@ async fn load_upload_state(
 ) -> Result<UploadStateRow, StatusCode> {
     sqlx::query_as::<_, UploadStateRow>(
         r#"
-        SELECT video_id, file_extension, total_bytes, uploaded_bytes, status
+        SELECT video_upload.video_id, video.asset_directory,
+               video_upload.file_extension, video_upload.total_bytes,
+               video_upload.uploaded_bytes, video_upload.status
         FROM video_upload
+        INNER JOIN video ON video.id = video_upload.video_id
         WHERE id = $1 AND user_id = $2
         "#,
     )
