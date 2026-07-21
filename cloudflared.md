@@ -4,6 +4,7 @@ step1: cloudflare 官网
 - Aliyun域名列表-DNS管理-DNS修改-添加两条NS：cass.ns.cloudflare.com / neil.ns.cloudflare.com
 - 以后阿里云之负责注册和实名认证，Cloudflare负责DNS记录，免费自带HTTPS等安全防护
 
+
 step2: 关闭vpn
 
 step3: 配置tunnel
@@ -54,3 +55,17 @@ sudo killall -HUP mDNSResponder
 curl https://a.kopiano.cc/api/health
 正常应返回：
 {"status":"ok"}
+
+修改后等待 DNS 生效，再执行：
+dig +short NS kopiano.cc
+dig +short a.kopiano.cc
+
+如果希望系统整体不使用 IPv6，可以在 macOS 当前网络接口执行：
+
+networksetup -listallnetworkservices
+sudo networksetup -setv6off "Wi-Fi"
+恢复 IPv6：
+sudo networksetup -setv6automatic "Wi-Fi"
+通常建议只对 curl 使用 -4，不要关闭系统 IPv6。
+networksetup -getinfo "Wi-Fi"
+是前端env文件中域名没改！不是网络的问题

@@ -12,7 +12,6 @@ pub fn cors() -> CorsLayer {
         .allow_origin([
             "http://localhost:3000".parse::<HeaderValue>().unwrap(),
             "http://127.0.0.1:3000".parse::<HeaderValue>().unwrap(),
-            "https://www.coulsonzero.shop".parse::<HeaderValue>().unwrap(),
             "https://kopiano.cc".parse::<HeaderValue>().unwrap(),
         ])
         .allow_headers([AUTHORIZATION, ACCEPT, CONTENT_TYPE, USER_AGENT, RANGE, HeaderName::from_static("upload-offset")])
