@@ -21,6 +21,7 @@ use crate::models::user::{AuthResponse, LoginInput, RegisterInput, User};
 // Used for unknown users so the response path still performs bcrypt verification.
 const DUMMY_PASSWORD_HASH: &str = "$2y$08$mnpm4SdYbuv8jY6GBq5DxOeLZWTbhoyhFStR7UclYBrbt0pCQ6SYC";
 const BCRYPT_COST: u32 = 8;
+const AUTH_COOKIE_DOMAIN: &str = ".kopiano.cc";
 
 pub async fn register(
     headers: HeaderMap,
@@ -193,7 +194,7 @@ fn build_auth_cookie(value: String, max_age: time::Duration, local: bool) -> Coo
     } else {
         cookie
             .secure(true)
-            .domain(".coulsonzero.shop")
+            .domain(AUTH_COOKIE_DOMAIN)
             .same_site(SameSite::None)
             .build()
     };

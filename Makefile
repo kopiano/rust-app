@@ -25,6 +25,6 @@ kill:
 	fi
 
 cloud:
-	@cloudflared tunnel --config ~/.cloudflared/rust-app.yml --protocol http2 run rust-app
+	@cloudflared tunnel run backend-api		# @cloudflared tunnel --config ~/.cloudflared/rust-app.yml --protocol http2 run rust-app
 
 # 终端生成hash密码：htpasswd -bnBC 8 user '明文密码'
