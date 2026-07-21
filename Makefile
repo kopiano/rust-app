@@ -5,6 +5,18 @@ docker-start:
 docker-stop:
 	@docker compose down -v
 
+# update
+docker-run:
+	@docker compose up -d --build --force-recreate backend
+
+docker-log:
+	@docker compose logs -f backend
+
+
+
+
+
+
 push:
 	@bash push.sh
 

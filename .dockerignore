@@ -1,0 +1,11 @@
+.git
+.idea
+.claude
+.codex
+target
+logs
+src/assets
+#.env
+*.md
+scripts
+push.sh
