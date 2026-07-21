@@ -1,7 +1,7 @@
 # cloudflare tunnel
 
 
-```shell
+```sh
 $ cloudflared tunnel create rust-app
 $ ls -la ~/.cloudflared
 $ vim ~/.cloudflared/rust-app.yml

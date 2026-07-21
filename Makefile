@@ -26,3 +26,5 @@ kill:
 
 cloud:
 	@cloudflared tunnel --config ~/.cloudflared/rust-app.yml --protocol http2 run rust-app
+
+# 终端生成hash密码：htpasswd -bnBC 8 user '明文密码'
