@@ -1,0 +1,4 @@
+ALTER TABLE "user" DROP CONSTRAINT IF EXISTS user_role_check;
+
+ALTER TABLE "user"
+    ALTER COLUMN role TYPE TEXT;

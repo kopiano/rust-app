@@ -72,6 +72,7 @@ pub struct MessageUserInfo {
     pub chat_type: String,
     pub avatar: Option<String>,
     pub username: String,
+    pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub online: Option<bool>,
     pub is_pro: bool,

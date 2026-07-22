@@ -913,6 +913,7 @@ pub async fn user_info(
             'private' AS chat_type,
             u.avatar,
             u.name AS username,
+            u.role,
             FALSE AS online,
             (
                 LOWER(BTRIM(u.plan)) = 'pro'
@@ -934,6 +935,7 @@ pub async fn user_info(
             'public' AS chat_type,
             c.avatar,
             c.name AS username,
+            NULL::text AS role,
             NULL::boolean AS online,
             FALSE AS is_pro,
             gl.content,
