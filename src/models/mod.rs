@@ -1,3 +1,4 @@
+pub mod character;
 pub mod message;
 pub mod moment;
 pub mod music;

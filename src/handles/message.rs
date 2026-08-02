@@ -12,6 +12,7 @@ use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
+    time::Instant,
 };
 use uuid::Uuid;
 
@@ -20,8 +21,8 @@ use crate::{
     common::response::ApiResponse,
     middleware::jwt::Claims,
     models::message::{
-        AddGroupMembersRequest, AddGroupMembersResponse, CreateGroupRequest, CreateGroupResponse,
-        Message, MessageBroadcast, MessageUserInfo, SendMessageRequest,
+        AddGroupMembersRequest, AddGroupMembersResponse, AutomaticReplyRequest, CreateGroupRequest,
+        CreateGroupResponse, Message, MessageBroadcast, MessageUserInfo, SendMessageRequest,
     },
 };
 
@@ -146,6 +147,7 @@ pub async fn send(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
+    let db_started_at = Instant::now();
     let message = sqlx::query_as::<_, Message>(
         r#"
         INSERT INTO "message" (
@@ -174,11 +176,122 @@ pub async fn send(
         tracing::error!(%error, %sender_id, "Failed to send message");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
+    tracing::info!(
+        target: "app::message",
+        stage = "message_db",
+        elapsed_ms = db_started_at.elapsed().as_millis(),
+        message_id = %message.id,
+        "Message persisted"
+    );
 
     let event = MessageBroadcast {
         event: "message",
         message: message.clone(),
         recipients,
+    };
+    match state.message_hub.dispatch(&event).await {
+        Ok(report) if report.dropped > 0 => tracing::warn!(
+            message_id = message.id,
+            delivered = report.delivered,
+            dropped = report.dropped,
+            "Dropped slow message WebSocket connections"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(%error, message_id = message.id, "Failed to serialize message event");
+        }
+    }
+
+    Ok(Json(ApiResponse::success(message)))
+}
+
+pub async fn persist_automatic_reply(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<AutomaticReplyRequest>,
+) -> Result<Json<ApiResponse<Message>>, StatusCode> {
+    let receiver_id = claims
+        .sub
+        .parse::<Uuid>()
+        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if input.sender_id == receiver_id {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let content = input.content.trim().to_string();
+    if content.is_empty() || content.chars().count() > 10_000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let is_system_user = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(
+            SELECT 1 FROM "user" WHERE id = $1 AND role = 'system'
+        )"#,
+    )
+    .bind(input.sender_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, sender_id = %input.sender_id, "Failed to validate automatic reply sender");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if !is_system_user {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let (first, second) = if input.sender_id.as_bytes() <= receiver_id.as_bytes() {
+        (input.sender_id, receiver_id)
+    } else {
+        (receiver_id, input.sender_id)
+    };
+    let conversation_id = Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("private:{first}:{second}").as_bytes(),
+    );
+
+    let db_started_at = Instant::now();
+    let message = sqlx::query_as::<_, Message>(
+        r#"
+        INSERT INTO "message" (
+            conversation_id, chat_type, send_id, client_message_id,
+            receiver_id, content, message_type, status
+        )
+        VALUES ($1, 'private', $2, $3, $4, $5, 1, 'sent')
+        ON CONFLICT (send_id, client_message_id) DO UPDATE
+            SET id = "message".id
+        RETURNING id, conversation_id, chat_type, send_id, receiver_id, group_id,
+                  client_message_id, content, message_type, status, created_at, update_at, deleted_at,
+                  file_name, file_url
+        "#,
+    )
+    .bind(conversation_id)
+    .bind(input.sender_id)
+    .bind(input.client_message_id)
+    .bind(receiver_id)
+    .bind(content)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|error| {
+        tracing::error!(
+            %error,
+            sender_id = %input.sender_id,
+            %receiver_id,
+            "Failed to persist automatic reply"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    tracing::info!(
+        target: "app::message",
+        stage = "automatic_reply_db",
+        elapsed_ms = db_started_at.elapsed().as_millis(),
+        message_id = %message.id,
+        "Automatic reply persisted"
+    );
+
+    let event = MessageBroadcast {
+        event: "message",
+        message: message.clone(),
+        recipients: vec![input.sender_id, receiver_id],
     };
     match state.message_hub.dispatch(&event).await {
         Ok(report) if report.dropped > 0 => tracing::warn!(

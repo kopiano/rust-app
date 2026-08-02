@@ -46,6 +46,10 @@ services:
       PORT: 8100
       LOG_FILE: /app/logs/rust-app.log
       FFMPEG_PATH: ffmpeg
+      VOICE_API_URL: ${VOICE_API_URL:-http://host.docker.internal:8200}
+      VOICE_TRAINING_URL: ${VOICE_TRAINING_URL:-http://host.docker.internal:9881}
+      VOICE_TRAINING_TOKEN: ${VOICE_TRAINING_TOKEN:-}
+      VOICE_TRAIN_DIR: /app/src/assets/train
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,7 +68,54 @@ services:
       retries: 10
       start_period: 15s
 
+  gpt-sovits:
+    image: gpt-sovits-local
+    container_name: kopiano-gpt-sovits
+    platform: linux/arm64
+    working_dir: /workspace/GPT-SoVITS
+    entrypoint: ["/bin/bash", "/bridge/entrypoint.sh"]
+    environment:
+      GPT_SOVITS_PRETRAINED_DIR: /workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
+      GPT_SOVITS_MODEL_REPO: ${GPT_SOVITS_MODEL_REPO:-lj1995/GPT-SoVITS}
+      GPT_SOVITS_MODEL_REVISION: ${GPT_SOVITS_MODEL_REVISION:-main}
+      HF_ENDPOINT: ${HF_ENDPOINT:-https://huggingface.co}
+    ports:
+      - "9880:9880"
+    volumes:
+      - ./gpt-sovits-local/entrypoint.sh:/bridge/entrypoint.sh:ro
+      - ./gpt-sovits-local/download_pretrained.py:/bridge/download_pretrained.py:ro
+      - ./src/assets/train:/data/train:ro
+      - gpt_sovits_pretrained:/workspace/GPT-SoVITS/GPT_SoVITS/pretrained_models
+      - gpt_sovits_media:/data/media:ro
+    restart: unless-stopped
+
+  gpt-sovits-api:
+    build:
+      context: ./gpt-sovits-local
+      dockerfile: Dockerfile.voice-api
+    container_name: kopiano-gpt-sovits-api
+    environment:
+      VOICE_TRAIN_DIR: /data/train
+      VOICE_MEDIA_DIR: /data/media
+      GPT_SOVITS_BASE_URL: http://gpt-sovits:9880
+      PUBLIC_BASE_URL: ${VOICE_PUBLIC_BASE_URL:-http://localhost:8200}
+      VOICE_TTS_BATCH_SIZE: ${VOICE_TTS_BATCH_SIZE:-4}
+      VOICE_TTS_CACHE_ENABLED: ${VOICE_TTS_CACHE_ENABLED:-true}
+      VOICE_TTS_CHUNK_MAX_CHARACTERS: ${VOICE_TTS_CHUNK_MAX_CHARACTERS:-48}
+      VOICE_PRELOAD_MODELS: ${VOICE_PRELOAD_MODELS:-}
+      VOICE_PRELOAD_WARMUP: ${VOICE_PRELOAD_WARMUP:-true}
+    depends_on:
+      - gpt-sovits
+    ports:
+      - "8200:8200"
+    volumes:
+      - ./src/assets/train:/data/train:ro
+      - gpt_sovits_media:/data/media
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
   backend_logs:
+  gpt_sovits_pretrained:
+  gpt_sovits_media:

@@ -1,12 +1,15 @@
 use crate::app::AppState;
-use crate::handles::{auth, message, moment, music, subscription, system, task, user, video};
+use crate::handles::{
+    auth, character, message, moment, music, subscription, system, task, user, video, voice,
+    voice_training,
+};
 use crate::middleware::{concurrency, cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::{HeaderValue, header::CACHE_CONTROL},
     middleware,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use tower::ServiceBuilder;
 use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
@@ -27,6 +30,8 @@ pub fn create_router(state: AppState) -> Router {
         .merge(video_api(state.clone()))
         .merge(subscription_api(state.clone()))
         .merge(task_api(state.clone()))
+        .merge(character_api(state.clone()))
+        .merge(voice_api(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             concurrency::limit_http,
@@ -136,9 +141,63 @@ fn task_api(state: AppState) -> Router<AppState> {
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
 }
 
+fn voice_api(state: AppState) -> Router<AppState> {
+    let authenticated = Router::new()
+        .route("/voice/llm/test", post(voice::test_llm))
+        .route("/voice/llm/chat", post(voice::llm_chat))
+        .route("/voice/llm/chat/stream", post(voice::llm_chat_stream))
+        .route("/jobs", post(voice_training::create_job))
+        .route("/jobs/{job_id}", get(voice_training::get_job))
+        .route(
+            "/jobs/{job_id}/artifacts",
+            get(voice_training::get_artifacts),
+        )
+        .route("/jobs/{job_id}/ack", post(voice_training::ack_job))
+        .route("/voice/chat", post(voice::voice_chat))
+        .layer(DefaultBodyLimit::max(
+            2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            concurrency::limit_upload,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt::require_auth,
+        ));
+    let media = Router::new().route("/voice/media/{filename}", get(voice::media));
+    Router::new().merge(authenticated).merge(media)
+}
+
+fn character_api(state: AppState) -> Router<AppState> {
+    let public = Router::new()
+        .route("/characters", get(character::list))
+        .route("/characters/{id}", get(character::get));
+    let authenticated = Router::new()
+        .route(
+            "/character-bindings/{contact_user_id}",
+            get(character::get_binding).put(character::save_binding),
+        )
+        .route("/chat/session", post(character::create_session))
+        .route("/chat/message", post(character::send_message))
+        .route("/tts", post(character::tts))
+        .route("/tts/stream", get(character::tts_stream))
+        .route("/tts/ws", get(character::tts_websocket))
+        .route("/admin/characters", post(character::admin_create))
+        .route("/admin/characters/{id}/models", get(character::list_models))
+        .route("/admin/characters/{id}/model", put(character::switch_model))
+        .route("/admin/characters/{id}", delete(character::admin_delete))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new().merge(public).merge(authenticated)
+}
+
 fn message_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/message", post(message::send))
+        .route(
+            "/message/automatic-reply",
+            post(message::persist_automatic_reply),
+        )
         .route(
             "/message/image",
             post(message::send_image)

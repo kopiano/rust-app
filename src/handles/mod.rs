@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod character;
 pub mod message;
 pub mod moment;
 pub mod music;
@@ -7,3 +8,5 @@ pub mod system;
 pub mod task;
 pub mod user;
 pub mod video;
+pub mod voice;
+pub mod voice_training;

@@ -1,12 +1,12 @@
 [package]
 name = "rust-app"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws", "multipart"] }
 axum-extra = { version = "0.10", features = ["cookie"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "stream", "rustls-tls"] }
 tokio = { version = "1.52.3", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -15,6 +15,7 @@ redis = { version = "0.28", features = ["tokio-comp"] }
 jsonwebtoken = "9"
 bcrypt = "0.16"
 dotenvy = "0.15"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 tower-http = { version = "0.7.0", features = ["cors", "fs", "set-header"] }
@@ -28,3 +29,5 @@ base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 ncm2mp3-core = "0.3.1"
 sha2 = "0.10"
+tokio-util = { version = "0.7", features = ["io"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }

@@ -2,9 +2,6 @@
 docker-start:
 	@docker compose up -d
 
-docker-stop:
-	@docker compose down -v
-
 # 使用现有镜像，只删除并重新创建容器。适合修改了环境变量、端口、挂载目录、Compose 配置等情况，速度较快
 docker-run:
 	@docker compose up -d --force-recreate backend
@@ -18,8 +15,7 @@ docker-log:
 
 
 
-
-
+# --------------------------------------------------------
 
 push:
 	@bash push.sh
@@ -28,9 +24,6 @@ push:
 run:
 	@sqlx migrate run
 	@cargo run
-
-load-test:
-	@bash scripts/load-test.sh
 
 kill:
 	@pids=$$(lsof -t -i :8100); \

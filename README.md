@@ -46,6 +46,69 @@ cargo add bcrypt       # password encryption
 ### run
 本机启动axum项目，docker部署postgresql和redis
 
+### GPT-SoVITS 角色语音
+
+浏览器上传 WAV/List 到 Rust 后端，原始素材和最终 PTH、CKPT、日志、
+manifest 都永久保存在 `src/assets/train/`。RTX 主机只负责临时训练，
+Mac 本地 GPT-SoVITS 容器只负责训练完成后的语音推理。
+
+```text
+POST /api/jobs                     保存训练包并立即返回本地 job_id
+GET  /api/jobs/{job_id}            同步 progress、stage、error
+GET  /api/jobs/{job_id}/artifacts  下载 Mac 已校验的产物 ZIP
+POST /api/jobs/{job_id}/ack        确认 Mac 已完整保存并通知 RTX 主机
+```
+
+Mac 后端配置：
+
+```dotenv
+VOICE_TRAINING_URL=https://example.ngrok-free.app
+VOICE_TRAINING_TOKEN=replace-with-a-long-random-secret
+VOICE_TRAIN_DIR=src/assets/train
+```
+
+RTX 主机复制 `gpt-sovits/` 后启动独立训练服务：
+
+```powershell
+cd gpt-sovits
+Copy-Item .env.remote.example .env
+python -m pip install -r requirements.txt
+python trainer.py
+```
+
+RTX 主机需要先安装带 NVIDIA CUDA 支持的 PyTorch 和完整的上游
+GPT-SoVITS 运行环境。编辑 `.env`，将 `GPT_SOVITS_ROOT` 指向上游
+GPT-SoVITS 目录。训练服务默认使用当前 Python 解释器执行同目录的
+`train_pipeline.py`，无需配置训练命令。服务监听 `0.0.0.0:9881`，
+可用 `ngrok http 9881` 暴露给 Mac 后端。
+
+远端接口使用相同的四个 `/jobs` 路径。`VOICE_TRAINING_TOKEN` 留空时不校验
+Bearer Token；公网暴露时建议设置随机 Token，并在 Mac 后端使用相同值。
+RTX 服务生成带 SHA-256 的 `manifest.json`；Mac 校验 ZIP 内每个文件后再
+更新模型为 `ready`。ACK 是幂等标记，不会自动删除远端文件。
+
+训练完成后的本地推理不依赖 RTX 训练主机。`gpt-sovits` 服务运行上游
+`api_v2.py`，首次启动会把 GPT-SoVITS V2 基础预训练模型下载到 Docker
+卷 `gpt_sovits_pretrained`。角色的 CKPT、PTH、参考音频和参考文本仍直接
+从 `src/assets/train/<角色>/v<版本>/` 读取，不复制或改变文件位置。
+
+```shell
+docker compose up -d gpt-sovits gpt-sovits-api
+curl -sS http://127.0.0.1:8200/health
+```
+
+下载 Hugging Face 模型受限时，可在 `.env` 设置兼容的镜像端点：
+
+```dotenv
+HF_ENDPOINT=https://huggingface.co
+```
+
+远端训练服务测试：
+
+```shell
+python3 -m unittest -v gpt-sovits/test_train_pipeline.py
+```
+
 ### postgresql
 ```sh
 brew install postgresql@18      # macos need update xcode@latest

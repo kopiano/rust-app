@@ -14,6 +14,13 @@ pub struct SendMessageRequest {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct AutomaticReplyRequest {
+    pub sender_id: Uuid,
+    pub content: String,
+    pub client_message_id: Uuid,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct CreateGroupRequest {
     pub name: String,
     pub member_ids: Vec<Uuid>,
