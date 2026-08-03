@@ -17,7 +17,9 @@ use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 6 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
-const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
+const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
+const NO_STORE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=2592000";
 
 fn asset_directory(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -51,7 +53,7 @@ pub fn create_router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
                 ))
                 .service(ServeDir::new(asset_directory("avatar"))),
         )
@@ -60,7 +62,7 @@ pub fn create_router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
                 ))
                 .service(ServeDir::new(asset_directory("image"))),
         )
@@ -69,7 +71,7 @@ pub fn create_router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
                 ))
                 .service(ServeDir::new(asset_directory("moment"))),
         )
@@ -78,7 +80,7 @@ pub fn create_router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
                 ))
                 .service(ServeDir::new(asset_directory("video"))),
         )
@@ -87,7 +89,7 @@ pub fn create_router(state: AppState) -> Router {
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
                 ))
                 .service(ServeDir::new(asset_directory("music"))),
         )
@@ -362,7 +364,11 @@ fn video_api(state: AppState) -> Router<AppState> {
             "/video/collections/{id}",
             patch(video::update_collection).delete(video::delete_collection),
         )
-        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth))
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static(NO_STORE_CACHE_CONTROL),
+        ));
 
     Router::new().merge(public).merge(authenticated)
 }

@@ -40,7 +40,7 @@ const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MOMENT_PAGE_SIZE: i64 = 10;
 const MAX_MOMENT_PAGE_SIZE: i64 = 50;
-const HLS_SEGMENT_SECONDS: &str = "6";
+const HLS_SEGMENT_SECONDS: &str = "2";
 const MOMENT_VIEW_UTC_OFFSET_HOURS: i64 = 8;
 const MOMENT_VISITOR_COOKIE: &str = "visitor_id";
 
@@ -1040,7 +1040,7 @@ async fn transcode_video_to_hls(
             "-ac",
             "2",
             "-force_key_frames",
-            "expr:gte(t,n_forced*6)",
+            "expr:gte(t,n_forced*2)",
             "-f",
             "hls",
             "-hls_time",

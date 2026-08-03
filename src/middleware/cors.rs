@@ -13,6 +13,7 @@ pub fn cors() -> CorsLayer {
             "http://localhost:3000".parse::<HeaderValue>().unwrap(),
             "http://127.0.0.1:3000".parse::<HeaderValue>().unwrap(),
             "https://kopiano.cc".parse::<HeaderValue>().unwrap(),
+            "https://a.kopiano.cc".parse::<HeaderValue>().unwrap(),
         ])
         .allow_headers([
             AUTHORIZATION,
@@ -20,6 +21,8 @@ pub fn cors() -> CorsLayer {
             CONTENT_TYPE,
             USER_AGENT,
             RANGE,
+            HeaderName::from_static("cache-control"),
+            HeaderName::from_static("pragma"),
             HeaderName::from_static("upload-offset"),
         ])
         .expose_headers([

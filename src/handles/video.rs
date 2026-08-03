@@ -33,8 +33,8 @@ use crate::{
     middleware::{jwt::Claims, plan::has_library_access},
     models::video::{
         CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
-        VideoCollection, VideoComment, VideoCommentLikeState, VideoListItem, VideoListPage, VideoReactionState,
-        VideoUploadSession, VideoViewState,
+        VideoCollection, VideoComment, VideoCommentLikeState, VideoListItem, VideoListPage,
+        VideoReactionState, VideoUploadSession, VideoViewState,
     },
 };
 
@@ -42,14 +42,16 @@ const VIDEO_ASSET_ROOT: &str = "src/assets/video";
 const VIDEO_ASSET_URL: &str = "/api/assets/video";
 const MAX_FREE_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 6 * 1024 * 1024 * 1024;
-const VIDEO_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+// Keep each request short enough for slow clients behind Cloudflare Tunnel.
+const VIDEO_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 255;
 const MAX_DESCRIPTION_CHARS: usize = 10_000;
 const MAX_COMMENT_CHARS: usize = 1_000;
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
-const HLS_SEGMENT_SECONDS: &str = "6";
+// Short segments reduce the time from a play click to the first decodable frame.
+const HLS_SEGMENT_SECONDS: &str = "2";
 const VIDEO_COVER_WIDTH: u32 = 640;
 const VIDEO_COVER_HEIGHT: u32 = 360;
 const VIDEO_POSTER_CANDIDATE_COUNT: u32 = 12;
@@ -669,11 +671,38 @@ pub async fn upload_chunk(
     .await
     .map_err(internal_db_error)?
     .ok_or(StatusCode::NOT_FOUND)?;
+    let expected_offset = state_row.uploaded_bytes.max(0) as u64;
+    let total_bytes = state_row.total_bytes.max(0) as u64;
+    if state_row.status == "complete" {
+        transaction.rollback().await.map_err(internal_db_error)?;
+        let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
+        return Ok(Json(ApiResponse::success(VideoUploadSession {
+            upload_id,
+            video,
+            chunk_size: VIDEO_UPLOAD_CHUNK_BYTES as u64,
+            uploaded_bytes: expected_offset,
+            total_bytes,
+            complete: true,
+        })));
+    }
     if state_row.status != "uploading" {
         return Err(StatusCode::CONFLICT);
     }
-    let expected_offset = state_row.uploaded_bytes.max(0) as u64;
-    let total_bytes = state_row.total_bytes.max(0) as u64;
+    // A response may be lost after the chunk has been persisted. Treat a
+    // repeated offset as an idempotent retry and report the authoritative
+    // server progress instead of rejecting the whole upload.
+    if offset < expected_offset {
+        transaction.rollback().await.map_err(internal_db_error)?;
+        let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
+        return Ok(Json(ApiResponse::success(VideoUploadSession {
+            upload_id,
+            video,
+            chunk_size: VIDEO_UPLOAD_CHUNK_BYTES as u64,
+            uploaded_bytes: expected_offset,
+            total_bytes,
+            complete: false,
+        })));
+    }
     if offset != expected_offset || offset.saturating_add(body.len() as u64) > total_bytes {
         return Err(StatusCode::CONFLICT);
     }
@@ -704,7 +733,7 @@ pub async fn upload_chunk(
         r#"
         UPDATE video_upload
         SET uploaded_bytes = $3, updated_at = NOW()
-        WHERE id = $1 AND user_id = $2
+        WHERE video_upload.id = $1 AND video_upload.user_id = $2
         "#,
     )
     .bind(upload_id)
@@ -767,12 +796,33 @@ pub async fn complete_upload(
         video_directory(state_row.video_id, state_row.asset_directory.as_deref());
     let temporary_path = upload_temporary_path(&output_directory, &state_row.file_extension);
     let final_path = output_directory.join(format!("source.{}", state_row.file_extension));
-    tokio::fs::rename(&temporary_path, &final_path)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "Failed to finalize resumable video upload");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    // The client can lose the completion response after the rename has
+    // succeeded. Make retries idempotent by accepting an already-finalized
+    // source file instead of trying to rename the missing temporary file.
+    match tokio::fs::metadata(&final_path).await {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            tracing::error!(path = %final_path.display(), "Final video upload path is not a file");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        Err(final_error) if final_error.kind() == std::io::ErrorKind::NotFound => {
+            if let Err(rename_error) = tokio::fs::rename(&temporary_path, &final_path).await {
+                if tokio::fs::metadata(&final_path).await.is_err() {
+                    tracing::error!(
+                        %rename_error,
+                        path = %temporary_path.display(),
+                        final_path = %final_path.display(),
+                        "Failed to finalize resumable video upload"
+                    );
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, path = %final_path.display(), "Failed to inspect finalized video upload");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     sqlx::query(
         r#"
         UPDATE video_upload
@@ -1893,6 +1943,7 @@ async fn set_comment_like(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+#[warn(dead_code)]
 async fn load_view_state(
     db: &PgPool,
     video_id: Uuid,
@@ -2304,10 +2355,11 @@ async fn transcode_video_to_hls(
         .args([
             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
             "-preset", "veryfast", "-crf", "23",
-            "-vf", "scale=w='min(3840,iw)':h='min(2160,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+            "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-pix_fmt", "yuv420p", "-maxrate", "5M", "-bufsize", "10M",
+            "-c:a", "aac", "-b:a", "128k",
             "-ar", "48000", "-ac", "2",
-            "-force_key_frames", "expr:gte(t,n_forced*6)",
+            "-force_key_frames", "expr:gte(t,n_forced*2)",
             "-f", "hls", "-hls_time", HLS_SEGMENT_SECONDS,
             "-hls_playlist_type", "vod", "-hls_segment_type", "mpegts",
             "-hls_flags", "independent_segments", "-hls_segment_filename",
@@ -2672,9 +2724,11 @@ fn encode_cover(bytes: &[u8]) -> Result<Vec<u8>, String> {
         image::imageops::FilterType::Lanczos3,
     );
     let rgb = resized.to_rgb8();
-    Ok(Encoder::from_rgb(&rgb, VIDEO_COVER_WIDTH, VIDEO_COVER_HEIGHT)
-        .encode_lossless()
-        .to_vec())
+    Ok(
+        Encoder::from_rgb(&rgb, VIDEO_COVER_WIDTH, VIDEO_COVER_HEIGHT)
+            .encode_lossless()
+            .to_vec(),
+    )
 }
 
 async fn cleanup_video_directory(path: &FsPath) {
