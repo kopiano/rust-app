@@ -43,9 +43,34 @@ pub struct Video {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct VideoListItem {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub username: String,
+    pub avatar: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub cover_url: String,
+    pub duration: i32,
+    pub status: String,
+    pub visibility: String,
+    pub processing_progress: i16,
+    pub view_count: i64,
+    pub like_count: i64,
+    pub comment_count: i64,
+    pub favorite_count: i64,
+    pub liked: bool,
+    pub favorited: bool,
+    pub owned: bool,
+    pub categories: Json<Vec<VideoCategory>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VideoListPage {
-    pub items: Vec<Video>,
+    pub items: Vec<VideoListItem>,
     pub has_more: bool,
     pub next_before_created_at: Option<DateTime<Utc>>,
     pub next_before_id: Option<Uuid>,

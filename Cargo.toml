@@ -27,6 +27,7 @@ chrono = { version = "0.4", features = ["serde"] }
 time = "0.3"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
+webp = "0.3"
 ncm2mp3-core = "0.3.1"
 sha2 = "0.10"
 tokio-util = { version = "0.7", features = ["io"] }

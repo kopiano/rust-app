@@ -2,6 +2,14 @@ use chrono::Utc;
 use uuid::Uuid;
 
 pub fn asset_directory_name(username: &str, id: Uuid) -> String {
+    format_asset_directory_name(username, &id.to_string())
+}
+
+pub fn video_asset_directory_name(username: &str, id: Uuid) -> String {
+    format_asset_directory_name(username, &id.to_string()[..8])
+}
+
+fn format_asset_directory_name(username: &str, identifier: &str) -> String {
     let username = username
         .chars()
         .filter_map(|character| {
@@ -18,12 +26,17 @@ pub fn asset_directory_name(username: &str, id: Uuid) -> String {
     } else {
         username
     };
-    format!("{}-{}-{}", Utc::now().format("%Y-%m-%d"), username, id)
+    format!(
+        "{}-{}-{}",
+        Utc::now().format("%Y-%m-%d"),
+        username,
+        identifier
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::asset_directory_name;
+    use super::{asset_directory_name, video_asset_directory_name};
     use uuid::Uuid;
 
     #[test]
@@ -42,5 +55,15 @@ mod tests {
         assert!(directory.contains("-shville-user-"));
         assert!(!directory.contains('/'));
         assert!(!directory.contains(".."));
+    }
+
+    #[test]
+    fn creates_short_video_directory_name() {
+        let directory = video_asset_directory_name(
+            "Shville",
+            Uuid::parse_str("a98bf134-1234-5678-9abc-def012345678").unwrap(),
+        );
+
+        assert!(directory.ends_with("-shville-a98bf134"));
     }
 }

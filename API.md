@@ -251,3 +251,38 @@ POST /moment/:id/like        点赞
 DELETE /moment/:id/unlike    取消点赞
 POST /moment/:id/comment     评论
 GET /moment/:id/comment      获取评论
+
+
+## video
+### 获取视频列表封面信息（进入视频页面获取）
+GET /api/video
+常用参数：
+GET /api/video?scope=public&limit=20
+注意：不用返回视频url
+
+响应示例：
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "id": "video-id",
+        "title": "刺绣视频",
+        "cover_url": "/api/assets/video/user/video-id/cover.webp",
+        "status": "ready"
+      }
+    ],
+    "has_more": true,
+    "next_before_created_at": "2026-08-03T09:00:00Z",
+    "next_before_id": "video-id"
+  }
+}
+```
+
+### 视频详情接口(点击视频封面获取)
+GET /api/videos/{video_id}
+例如：
+GET /api/video/5ec5d7bd-196a-43cf-b58f-d17e976bade5
+

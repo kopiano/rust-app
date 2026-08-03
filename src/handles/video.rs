@@ -1,5 +1,5 @@
 use std::{
-    io::{Cursor, SeekFrom},
+    io::SeekFrom,
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -16,7 +16,6 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
-use image::ImageFormat;
 use serde::Deserialize;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{
@@ -25,15 +24,16 @@ use tokio::{
     sync::Semaphore,
 };
 use uuid::Uuid;
+use webp::Encoder;
 
 use crate::{
     app::AppState,
-    common::assets::asset_directory_name,
+    common::assets::video_asset_directory_name,
     common::response::ApiResponse,
     middleware::{jwt::Claims, plan::has_library_access},
     models::video::{
         CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
-        VideoCollection, VideoComment, VideoCommentLikeState, VideoListPage, VideoReactionState,
+        VideoCollection, VideoComment, VideoCommentLikeState, VideoListItem, VideoListPage, VideoReactionState,
         VideoUploadSession, VideoViewState,
     },
 };
@@ -50,8 +50,8 @@ const MAX_COMMENT_CHARS: usize = 1_000;
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
 const HLS_SEGMENT_SECONDS: &str = "6";
-const VIDEO_COVER_WIDTH: u32 = 1920;
-const VIDEO_COVER_HEIGHT: u32 = 1080;
+const VIDEO_COVER_WIDTH: u32 = 640;
+const VIDEO_COVER_HEIGHT: u32 = 360;
 const VIDEO_POSTER_CANDIDATE_COUNT: u32 = 12;
 const VIDEO_VIEW_UTC_OFFSET_HOURS: i64 = 8;
 const VIDEO_VISITOR_COOKIE: &str = "video_visitor_id";
@@ -65,6 +65,7 @@ pub struct VideoListQuery {
     category: Option<String>,
     scope: Option<String>,
     collection_id: Option<Uuid>,
+    sort: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -180,14 +181,12 @@ pub async fn list(
         .map(normalize_slug)
         .filter(|value| !value.is_empty() && value != "all");
 
-    let mut videos = sqlx::query_as::<_, Video>(
+    let mut videos = sqlx::query_as::<_, VideoListItem>(
         r#"
         SELECT video.id, video.user_id, "user".name AS username, "user".avatar,
                video.title, video.description, video.cover_url, video.duration,
-               video.width, video.height, video.fps::double precision AS fps,
-               video.size, video.origin_file_url, video.hls_master_url,
                video.status, video.visibility, video.processing_progress,
-               video.processing_error, video.view_count, video.like_count,
+               video.view_count, video.like_count,
                video.comment_count, video.favorite_count,
                EXISTS (
                    SELECT 1 FROM video_like
@@ -303,7 +302,14 @@ pub async fn list(
         )
           AND (
               $1::timestamptz IS NULL
-              OR (video.created_at, video.id) < ($1, $2::uuid)
+              OR (
+                  $9::text = 'oldest'
+                  AND (video.created_at, video.id) > ($1, $2::uuid)
+              )
+              OR (
+                  COALESCE($9::text, '') <> 'oldest'
+                  AND (video.created_at, video.id) < ($1, $2::uuid)
+              )
           )
           AND (
               $4::text IS NULL
@@ -322,7 +328,11 @@ pub async fn list(
                     AND video_category.slug = $5
               )
           )
-        ORDER BY video.created_at DESC, video.id DESC
+        ORDER BY
+            CASE WHEN $9::text = 'oldest' THEN video.created_at END ASC,
+            CASE WHEN $9::text = 'oldest' THEN video.id END ASC,
+            CASE WHEN COALESCE($9::text, '') <> 'oldest' THEN video.created_at END DESC,
+            CASE WHEN COALESCE($9::text, '') <> 'oldest' THEN video.id END DESC
         LIMIT $6
         "#,
     )
@@ -334,6 +344,7 @@ pub async fn list(
     .bind(limit + 1)
     .bind(scope)
     .bind(query.collection_id)
+    .bind(query.sort.as_deref())
     .fetch_all(&state.db)
     .await
     .map_err(|error| {
@@ -348,7 +359,6 @@ pub async fn list(
     let next = has_more
         .then(|| videos.last().map(|video| (video.created_at, video.id)))
         .flatten();
-
     Ok(Json(ApiResponse::success(VideoListPage {
         items: videos,
         has_more,
@@ -428,7 +438,7 @@ pub async fn upload(
     let max_upload_bytes = max_video_upload_bytes(&state.db, user_id).await?;
     let video_id = Uuid::new_v4();
     let username = load_username(&state.db, user_id).await?;
-    let asset_directory = asset_directory_name(&username, video_id);
+    let asset_directory = video_asset_directory_name(&username, video_id);
     let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(&asset_directory);
     tokio::fs::create_dir_all(&output_directory)
         .await
@@ -538,7 +548,7 @@ pub async fn create_upload(
     let video_id = Uuid::new_v4();
     let upload_id = Uuid::new_v4();
     let username = load_username(&state.db, user_id).await?;
-    let asset_directory = asset_directory_name(&username, video_id);
+    let asset_directory = video_asset_directory_name(&username, video_id);
     let output_directory = FsPath::new(VIDEO_ASSET_ROOT).join(&asset_directory);
     tokio::fs::create_dir_all(&output_directory)
         .await
@@ -2414,7 +2424,7 @@ async fn generate_video_poster(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY)?;
-    tokio::fs::write(output_directory.join("poster.webp"), encoded)
+    tokio::fs::write(output_directory.join("poster.webp"), &encoded)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
@@ -2654,16 +2664,17 @@ async fn read_field_limited(field: &mut Field<'_>, limit: usize) -> Result<Vec<u
     Ok(bytes)
 }
 
-fn encode_cover(bytes: &[u8]) -> image::ImageResult<Vec<u8>> {
-    let image = image::load_from_memory(bytes)?;
+fn encode_cover(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let image = image::load_from_memory(bytes).map_err(|error| error.to_string())?;
     let resized = image.resize_to_fill(
         VIDEO_COVER_WIDTH,
         VIDEO_COVER_HEIGHT,
         image::imageops::FilterType::Lanczos3,
     );
-    let mut encoded = Cursor::new(Vec::new());
-    resized.write_to(&mut encoded, ImageFormat::WebP)?;
-    Ok(encoded.into_inner())
+    let rgb = resized.to_rgb8();
+    Ok(Encoder::from_rgb(&rgb, VIDEO_COVER_WIDTH, VIDEO_COVER_HEIGHT)
+        .encode_lossless()
+        .to_vec())
 }
 
 async fn cleanup_video_directory(path: &FsPath) {
@@ -2922,7 +2933,7 @@ mod tests {
     }
 
     #[test]
-    fn encodes_video_cover_as_1920_by_1080_webp() {
+    fn encodes_video_cover_as_640_by_360_lossless_webp() {
         let source = DynamicImage::ImageRgb8(RgbImage::new(900, 1600));
         let mut input = Cursor::new(Vec::new());
         source.write_to(&mut input, ImageFormat::Png).unwrap();
@@ -2931,7 +2942,7 @@ mod tests {
         assert_eq!(image::guess_format(&encoded).unwrap(), ImageFormat::WebP);
         assert_eq!(
             image::load_from_memory(&encoded).unwrap().dimensions(),
-            (1920, 1080)
+            (640, 360)
         );
     }
 }

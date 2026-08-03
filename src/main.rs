@@ -23,6 +23,7 @@ async fn main() {
     // postgresql, redis
     let pool = postgres::connect().await;
     tracing::info!(target: "app::db", "PostgreSQL connected");
+    // Rebuild this migration bundle when migration files change.
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await

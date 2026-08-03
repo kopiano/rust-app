@@ -19,6 +19,13 @@ const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 6 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 
+fn asset_directory(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("assets")
+        .join(name)
+}
+
 pub fn create_router(state: AppState) -> Router {
     let api = Router::new()
         .merge(system_api())
@@ -46,7 +53,7 @@ pub fn create_router(state: AppState) -> Router {
                     CACHE_CONTROL,
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
-                .service(ServeDir::new("src/assets/avatar")),
+                .service(ServeDir::new(asset_directory("avatar"))),
         )
         .nest_service(
             "/api/assets/image",
@@ -55,7 +62,7 @@ pub fn create_router(state: AppState) -> Router {
                     CACHE_CONTROL,
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
-                .service(ServeDir::new("src/assets/image")),
+                .service(ServeDir::new(asset_directory("image"))),
         )
         .nest_service(
             "/api/assets/moment",
@@ -64,16 +71,16 @@ pub fn create_router(state: AppState) -> Router {
                     CACHE_CONTROL,
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
-                .service(ServeDir::new("src/assets/moment")),
+                .service(ServeDir::new(asset_directory("moment"))),
         )
         .nest_service(
             "/api/assets/video",
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
-                    HeaderValue::from_static("public, max-age=31536000, immutable"),
+                    HeaderValue::from_static("no-store, no-cache, must-revalidate, max-age=0"),
                 ))
-                .service(ServeDir::new("src/assets/video")),
+                .service(ServeDir::new(asset_directory("video"))),
         )
         .nest_service(
             "/api/assets/music",
@@ -82,7 +89,7 @@ pub fn create_router(state: AppState) -> Router {
                     CACHE_CONTROL,
                     HeaderValue::from_static("public, max-age=31536000, immutable"),
                 ))
-                .service(ServeDir::new("src/assets/music")),
+                .service(ServeDir::new(asset_directory("music"))),
         )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
