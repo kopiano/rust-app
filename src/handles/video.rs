@@ -10,7 +10,10 @@ use axum::{
     Extension, Json,
     body::Bytes,
     extract::{Multipart, Path as AxumPath, Query, State, multipart::Field},
-    extract::{WebSocketUpgrade, ws::{Message as WsMessage, WebSocket}},
+    extract::{
+        WebSocketUpgrade,
+        ws::{Message as WsMessage, WebSocket},
+    },
     http::{
         HeaderMap, HeaderValue, StatusCode,
         header::{HOST, ORIGIN, REFERER},
@@ -19,9 +22,9 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
+use redis::AsyncCommands;
 use serde::Deserialize;
 use serde_json::Value;
-use redis::AsyncCommands;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
@@ -37,10 +40,10 @@ use crate::{
     common::response::ApiResponse,
     middleware::{jwt::Claims, plan::has_library_access},
     models::video::{
-        CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
-        VideoBannerItem, VideoCollection, VideoComment, VideoCommentLikeState, VideoHomeListItem,
-        VideoHomeListPage, VideoListItem, VideoListPage, VideoReactionState, VideoUploadSession,
-        VideoViewState, VideoProgressBroadcast,
+        CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoBannerItem,
+        VideoCategory, VideoCollection, VideoComment, VideoCommentLikeState, VideoHomeListItem,
+        VideoHomeListPage, VideoListItem, VideoListPage, VideoProgressBroadcast,
+        VideoReactionState, VideoUploadSession, VideoViewState,
     },
 };
 
@@ -282,6 +285,7 @@ pub async fn list(
         r#"
         SELECT video.id, video.user_id, "user".name AS username, "user".avatar,
                video.title, video.description, video.cover_url, video.duration,
+               video.width, video.height,
                video.status, video.visibility, video.processing_progress,
                video.view_count, video.like_count,
                video.comment_count, video.favorite_count,
@@ -905,6 +909,8 @@ pub async fn upload_chunk(
         video_id: state_row.video_id,
         status: "uploading".to_owned(),
         progress: ((uploaded_bytes.saturating_mul(100) / total_bytes.max(1)).min(100)) as i16,
+        width: None,
+        height: None,
     };
     let mut redis = state.redis.clone();
     store_video_progress(&mut redis, &event).await;
@@ -2342,13 +2348,9 @@ fn spawn_video_processing(
         let poster_directory = pending.output_directory.clone();
         let poster_duration = pending.duration_us;
         let poster_task = tokio::spawn(async move {
-            if let Err(status) = generate_video_poster(
-                &ffmpeg,
-                &poster_source,
-                &poster_directory,
-                poster_duration,
-            )
-            .await
+            if let Err(status) =
+                generate_video_poster(&ffmpeg, &poster_source, &poster_directory, poster_duration)
+                    .await
             {
                 tracing::warn!(%video_id, %status, "Unable to generate early video poster");
             } else {
@@ -2374,7 +2376,7 @@ fn spawn_video_processing(
                 ("failed", Some(status.to_string()))
             }
         };
-        if let Err(db_error) = sqlx::query(
+        let dimensions = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
             r#"
             UPDATE video
             SET status = $2,
@@ -2382,30 +2384,30 @@ fn spawn_video_processing(
                 processing_error = $3,
                 updated_at = NOW()
             WHERE id = $1
+            RETURNING width, height
             "#,
         )
         .bind(video_id)
         .bind(status)
         .bind(error)
-        .execute(&db)
+        .fetch_optional(&db)
         .await
-        {
+        .map_err(|db_error| {
             tracing::error!(%db_error, %video_id, "Failed to save video processing status");
-        }
-        let _ = video_tx.send(VideoProgressBroadcast {
-            event_type: "video_progress",
-            user_id: pending.user_id,
-            video_id,
-            status: status.to_owned(),
-            progress: if status == "ready" { 100 } else { 0 },
-        });
+        })
+        .ok()
+        .flatten()
+        .unwrap_or((None, None));
         let event = VideoProgressBroadcast {
             event_type: "video_progress",
             user_id: pending.user_id,
             video_id,
             status: status.to_owned(),
             progress: if status == "ready" { 100 } else { 0 },
+            width: dimensions.0,
+            height: dimensions.1,
         };
+        let _ = video_tx.send(event.clone());
         let mut redis = redis;
         store_video_progress(&mut redis, &event).await;
     });
@@ -2550,6 +2552,8 @@ async fn mark_video_processing_failed(
         video_id,
         status: "failed".to_owned(),
         progress: 0,
+        width: None,
+        height: None,
     });
 }
 
@@ -2577,7 +2581,7 @@ async fn transcode_video_to_hls(
         .args([
             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
             "-preset", "medium", "-crf", "20",
-            "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+            "-vf", "scale=w='min(3840,iw)':h='min(2160,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
             "-pix_fmt", "yuv420p", "-maxrate", "8M", "-bufsize", "16M",
             "-c:a", "aac", "-b:a", "128k",
             "-ar", "48000", "-ac", "2",
@@ -2626,8 +2630,7 @@ async fn transcode_video_to_hls(
         };
         let progress = ((out_time_us.saturating_mul(99) / duration_us.max(1)).min(99)) as i16;
         let should_update = progress > last_progress
-            && (progress >= 99
-                || last_progress_update.elapsed() >= StdDuration::from_millis(750));
+            && (progress >= 99 || last_progress_update.elapsed() >= StdDuration::from_millis(750));
         if should_update {
             last_progress = progress;
             last_progress_update = Instant::now();
@@ -2664,27 +2667,33 @@ async fn update_processing_progress(
     video_id: Uuid,
     progress: i16,
 ) {
-    if let Err(error) = sqlx::query(
+    let dimensions = sqlx::query_as::<_, (Option<i32>, Option<i32>)>(
         r#"
         UPDATE video
         SET processing_progress = GREATEST(processing_progress, $2),
             updated_at = NOW()
         WHERE id = $1 AND status = 'processing'
+        RETURNING width, height
         "#,
     )
     .bind(video_id)
     .bind(progress)
-    .execute(db)
+    .fetch_optional(db)
     .await
-    {
+    .map_err(|error| {
         tracing::warn!(%error, %video_id, %progress, "Failed to save video progress");
-    }
+    })
+    .ok()
+    .flatten()
+    .unwrap_or((None, None));
     let event = VideoProgressBroadcast {
         event_type: "video_progress",
         user_id,
         video_id,
         status: "processing".to_owned(),
         progress,
+        width: dimensions.0,
+        height: dimensions.1,
     };
     let _ = video_tx.send(event.clone());
     let mut redis = redis.clone();

@@ -11,6 +11,8 @@ pub struct VideoProgressBroadcast {
     pub video_id: Uuid,
     pub status: String,
     pub progress: i16,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -63,6 +65,8 @@ pub struct VideoListItem {
     pub description: Option<String>,
     pub cover_url: String,
     pub duration: i32,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
     pub status: String,
     pub visibility: String,
     pub processing_progress: i16,
