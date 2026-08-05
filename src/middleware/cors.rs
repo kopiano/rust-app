@@ -16,6 +16,9 @@ pub fn cors() -> CorsLayer {
             "https://a.kopiano.cc".parse::<HeaderValue>().unwrap(),
             "http://localhost:4173".parse::<HeaderValue>().unwrap(),
             "http://127.0.0.1:4173".parse::<HeaderValue>().unwrap(),
+            // Tauri 2 desktop WebView origins.
+            "http://tauri.localhost".parse::<HeaderValue>().unwrap(),
+            "tauri://localhost".parse::<HeaderValue>().unwrap(),
         ])
         .allow_headers([
             AUTHORIZATION,
