@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use crate::{
     app::runtime::{AppMetrics, RuntimeLimits},
     models::music::MusicProcessingBroadcast,
+    models::video::VideoProgressBroadcast,
     services::message_hub::MessageHub,
 };
 
@@ -33,6 +34,7 @@ pub struct AppState {
     pub subscription_webhook_secret: Option<String>,
     pub message_hub: Arc<MessageHub>,
     pub music_tx: broadcast::Sender<MusicProcessingBroadcast>,
+    pub video_tx: broadcast::Sender<VideoProgressBroadcast>,
     pub limits: Arc<RuntimeLimits>,
     pub metrics: Arc<AppMetrics>,
 }

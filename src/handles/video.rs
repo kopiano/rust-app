@@ -3,20 +3,25 @@ use std::{
     path::{Path as FsPath, PathBuf},
     process::Stdio,
     sync::Arc,
+    time::{Duration as StdDuration, Instant},
 };
 
 use axum::{
     Extension, Json,
     body::Bytes,
     extract::{Multipart, Path as AxumPath, Query, State, multipart::Field},
+    extract::{WebSocketUpgrade, ws::{Message as WsMessage, WebSocket}},
     http::{
-        HeaderMap, StatusCode,
+        HeaderMap, HeaderValue, StatusCode,
         header::{HOST, ORIGIN, REFERER},
     },
+    response::IntoResponse,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Deserialize;
+use serde_json::Value;
+use redis::AsyncCommands;
 use sqlx::{PgPool, Postgres, Transaction};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter},
@@ -33,8 +38,9 @@ use crate::{
     middleware::{jwt::Claims, plan::has_library_access},
     models::video::{
         CreateVideoCollection, CreateVideoComment, UpdateVideoCollection, Video, VideoCategory,
-        VideoCollection, VideoComment, VideoCommentLikeState, VideoListItem, VideoListPage,
-        VideoReactionState, VideoUploadSession, VideoViewState,
+        VideoBannerItem, VideoCollection, VideoComment, VideoCommentLikeState, VideoHomeListItem,
+        VideoHomeListPage, VideoListItem, VideoListPage, VideoReactionState, VideoUploadSession,
+        VideoViewState, VideoProgressBroadcast,
     },
 };
 
@@ -42,8 +48,9 @@ const VIDEO_ASSET_ROOT: &str = "src/assets/video";
 const VIDEO_ASSET_URL: &str = "/api/assets/video";
 const MAX_FREE_VIDEO_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BYTES: usize = 6 * 1024 * 1024 * 1024;
-// Keep each request short enough for slow clients behind Cloudflare Tunnel.
-const VIDEO_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
+// Larger chunks reduce request/transaction overhead while keeping resumable
+// uploads practical for clients behind Cloudflare Tunnel.
+const VIDEO_UPLOAD_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COVER_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TITLE_CHARS: usize = 255;
 const MAX_DESCRIPTION_CHARS: usize = 10_000;
@@ -51,7 +58,7 @@ const MAX_COMMENT_CHARS: usize = 1_000;
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
 // Short segments reduce the time from a play click to the first decodable frame.
-const HLS_SEGMENT_SECONDS: &str = "2";
+const HLS_SEGMENT_SECONDS: &str = "4";
 const VIDEO_COVER_WIDTH: u32 = 640;
 const VIDEO_COVER_HEIGHT: u32 = 360;
 const VIDEO_POSTER_CANDIDATE_COUNT: u32 = 12;
@@ -78,6 +85,31 @@ pub struct VideoCollectionQuery {
 #[derive(Default, Deserialize)]
 pub struct VideoCategoryQuery {
     scope: Option<String>,
+}
+
+pub async fn banner(
+    State(state): State<AppState>,
+    claims: Option<Extension<Claims>>,
+) -> Result<Json<ApiResponse<Vec<VideoBannerItem>>>, StatusCode> {
+    let _ = claims;
+    let videos = sqlx::query_as::<_, VideoBannerItem>(
+        r#"
+        SELECT video.cover_url, video.duration, video.width, video.height,
+               video.id, video.title, video.description, video.view_count,
+               "user".name AS username, "user".avatar
+        FROM video
+        INNER JOIN "user" ON "user".id = video.user_id
+        WHERE video.visibility = 'public'
+          AND video.status = 'ready'
+          AND video.published_at IS NOT NULL
+        ORDER BY video.created_at DESC, video.id DESC
+        LIMIT 5
+        "#,
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(internal_db_error)?;
+    Ok(Json(ApiResponse::success(videos)))
 }
 
 #[derive(Deserialize)]
@@ -120,6 +152,7 @@ struct ProbedVideo {
 }
 
 struct PendingVideo {
+    user_id: Uuid,
     source_path: PathBuf,
     output_directory: PathBuf,
     duration_us: u64,
@@ -146,7 +179,7 @@ pub async fn list(
     State(state): State<AppState>,
     claims: Option<Extension<Claims>>,
     Query(query): Query<VideoListQuery>,
-) -> Result<Json<ApiResponse<VideoListPage>>, StatusCode> {
+) -> Result<(HeaderMap, Json<ApiResponse<Value>>), StatusCode> {
     let user_id = optional_user_id(claims)?;
     if query.before_created_at.is_some() != query.before_id.is_some() {
         return Err(StatusCode::BAD_REQUEST);
@@ -183,6 +216,68 @@ pub async fn list(
         .map(normalize_slug)
         .filter(|value| !value.is_empty() && value != "all");
 
+    let is_home_list = scope == "public"
+        && query.query.as_deref().is_none()
+        && query.category.as_deref().is_none()
+        && query.collection_id.is_none()
+        && query.sort.as_deref().is_none()
+        && query.limit.unwrap_or(DEFAULT_PAGE_SIZE) == DEFAULT_PAGE_SIZE;
+
+    if is_home_list {
+        let mut videos = sqlx::query_as::<_, VideoHomeListItem>(
+            r#"
+            SELECT video.id, video.title, video.cover_url, video.duration,
+                   video.width, video.height, video.status,
+                   video.processing_progress, video.view_count, video.like_count,
+                   video.created_at
+            FROM video
+            WHERE video.visibility = 'public'
+              AND video.status = 'ready'
+              AND video.published_at IS NOT NULL
+              AND (
+                  $1::timestamptz IS NULL
+                  OR (video.created_at, video.id) < ($1, $2::uuid)
+              )
+            ORDER BY video.created_at DESC, video.id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(query.before_created_at)
+        .bind(query.before_id)
+        .bind(limit + 1)
+        .fetch_all(&state.db)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to list home videos");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        let has_more = videos.len() as i64 > limit;
+        if has_more {
+            videos.truncate(limit as usize);
+        }
+        let next = has_more
+            .then(|| videos.last().map(|video| (video.created_at, video.id)))
+            .flatten();
+
+        let page = serde_json::to_value(VideoHomeListPage {
+            items: videos,
+            has_more,
+            next_before_created_at: next.map(|value| value.0),
+            next_before_id: next.map(|value| value.1),
+        })
+        .map_err(|error| {
+            tracing::error!(%error, "Failed to serialize home video page");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=10, s-maxage=10, stale-while-revalidate=30"),
+        );
+        return Ok((headers, Json(ApiResponse::success(page))));
+    }
+
     let mut videos = sqlx::query_as::<_, VideoListItem>(
         r#"
         SELECT video.id, video.user_id, "user".name AS username, "user".avatar,
@@ -192,12 +287,14 @@ pub async fn list(
                video.comment_count, video.favorite_count,
                EXISTS (
                    SELECT 1 FROM video_like
-                   WHERE video_like.video_id = video.id
+                   WHERE $3::uuid IS NOT NULL
+                     AND video_like.video_id = video.id
                      AND video_like.user_id = $3
                ) AS liked,
                EXISTS (
                    SELECT 1 FROM video_favorite
-                   WHERE video_favorite.video_id = video.id
+                   WHERE $3::uuid IS NOT NULL
+                     AND video_favorite.video_id = video.id
                      AND video_favorite.user_id = $3
                ) AS favorited,
                COALESCE(video.user_id = $3, FALSE) AS owned,
@@ -361,12 +458,17 @@ pub async fn list(
     let next = has_more
         .then(|| videos.last().map(|video| (video.created_at, video.id)))
         .flatten();
-    Ok(Json(ApiResponse::success(VideoListPage {
+    let page = serde_json::to_value(VideoListPage {
         items: videos,
         has_more,
         next_before_created_at: next.map(|value| value.0),
         next_before_id: next.map(|value| value.1),
-    })))
+    })
+    .map_err(|error| {
+        tracing::error!(%error, "Failed to serialize video page");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((HeaderMap::new(), Json(ApiResponse::success(page))))
 }
 
 pub async fn get(
@@ -395,28 +497,26 @@ pub async fn categories(
 
     let categories = sqlx::query_as::<_, VideoCategory>(
         r#"
-        SELECT video_category.id, video_category.slug,
+        SELECT DISTINCT video_category.id, video_category.slug,
                video_category.name_zh, video_category.name_en
         FROM video_category
-        WHERE EXISTS (
-            SELECT 1
-            FROM video_category_map
-            INNER JOIN video ON video.id = video_category_map.video_id
-            WHERE video_category_map.category_id = video_category.id
-              AND video.status = 'ready'
-              AND CASE $2::text
-                  WHEN 'mine' THEN video.user_id = $1
-                  WHEN 'accessible' THEN
-                      video.user_id = $1
-                      OR (
-                          video.visibility = 'public'
-                          AND video.published_at IS NOT NULL
-                      )
-                  ELSE
+        INNER JOIN video_category_map
+            ON video_category_map.category_id = video_category.id
+        INNER JOIN video
+            ON video.id = video_category_map.video_id
+        WHERE video.status = 'ready'
+          AND CASE $2::text
+              WHEN 'mine' THEN video.user_id = $1
+              WHEN 'accessible' THEN
+                  video.user_id = $1
+                  OR (
                       video.visibility = 'public'
                       AND video.published_at IS NOT NULL
-              END
-        )
+                  )
+              ELSE
+                  video.visibility = 'public'
+                  AND video.published_at IS NOT NULL
+          END
         ORDER BY video_category.name_en ASC, video_category.id ASC
         "#,
     )
@@ -523,7 +623,10 @@ pub async fn upload(
     let video = load_video(&state.db, video_id, Some(user_id)).await?;
     spawn_uploaded_video_processing(
         state.db.clone(),
+        state.video_tx.clone(),
+        state.redis.clone(),
         state.limits.transcode.clone(),
+        user_id,
         video_id,
         source_path,
         output_directory,
@@ -625,6 +728,58 @@ pub async fn create_upload(
             complete: false,
         })),
     ))
+}
+
+pub async fn status_websocket(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    upgrade: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    let user_id = match authenticated_user_id(&claims) {
+        Ok(user_id) => user_id,
+        Err(status) => return status.into_response(),
+    };
+    upgrade
+        .on_upgrade(move |socket| video_status_session(socket, state, user_id))
+        .into_response()
+}
+
+async fn video_status_session(mut socket: WebSocket, state: AppState, user_id: Uuid) {
+    let mut events = state.video_tx.subscribe();
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Ok(event) if event.user_id == user_id => {
+                    let Ok(payload) = serde_json::to_string(&event) else { continue };
+                    if socket.send(WsMessage::Text(payload.into())).await.is_err() { break; }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(WsMessage::Close(_))) | None => break,
+                Some(Ok(WsMessage::Ping(payload))) => {
+                    if socket.send(WsMessage::Pong(payload)).await.is_err() { break; }
+                }
+                Some(Ok(WsMessage::Text(_))) | Some(Ok(WsMessage::Pong(_)))
+                | Some(Ok(WsMessage::Binary(_))) => {}
+                Some(Err(_)) => break,
+            }
+        }
+    }
+}
+
+async fn store_video_progress(
+    redis: &mut redis::aio::MultiplexedConnection,
+    event: &VideoProgressBroadcast,
+) {
+    let key = format!("video:progress:{}", event.video_id);
+    if let Ok(payload) = serde_json::to_string(event) {
+        let result: redis::RedisResult<()> = redis.set_ex(key, payload, 24 * 60 * 60).await;
+        if let Err(error) = result {
+            tracing::warn!(%error, video_id = %event.video_id, "Failed to persist video progress");
+        }
+    }
 }
 
 pub async fn upload_status(
@@ -744,6 +899,17 @@ pub async fn upload_chunk(
     .map_err(internal_db_error)?;
     transaction.commit().await.map_err(internal_db_error)?;
 
+    let event = VideoProgressBroadcast {
+        event_type: "video_progress",
+        user_id,
+        video_id: state_row.video_id,
+        status: "uploading".to_owned(),
+        progress: ((uploaded_bytes.saturating_mul(100) / total_bytes.max(1)).min(100)) as i16,
+    };
+    let mut redis = state.redis.clone();
+    store_video_progress(&mut redis, &event).await;
+    let _ = state.video_tx.send(event);
+
     let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
     Ok(Json(ApiResponse::success(VideoUploadSession {
         upload_id,
@@ -840,7 +1006,10 @@ pub async fn complete_upload(
     let video = load_video(&state.db, state_row.video_id, Some(user_id)).await?;
     spawn_uploaded_video_processing(
         state.db.clone(),
+        state.video_tx.clone(),
+        state.redis.clone(),
         state.limits.transcode.clone(),
+        user_id,
         state_row.video_id,
         final_path,
         output_directory,
@@ -980,6 +1149,7 @@ pub async fn update(
         .flatten();
         let output_directory = video_directory(video_id, asset_directory.as_deref());
         Some(PendingVideo {
+            user_id,
             source_path: source_path_for_video(&output_directory).await?,
             duration_us: video_duration_us(&state.db, video_id).await?,
             output_directory,
@@ -1077,6 +1247,8 @@ pub async fn update(
         cleanup_transcoded_video_files(&pending.output_directory).await;
         spawn_video_processing(
             state.db.clone(),
+            state.video_tx.clone(),
+            state.redis.clone(),
             state.limits.transcode.clone(),
             video_id,
             pending,
@@ -2151,6 +2323,8 @@ fn parse_frame_rate(value: &str) -> Option<f64> {
 
 fn spawn_video_processing(
     db: PgPool,
+    video_tx: tokio::sync::broadcast::Sender<VideoProgressBroadcast>,
+    redis: redis::aio::MultiplexedConnection,
     transcode_slots: Arc<Semaphore>,
     video_id: Uuid,
     pending: PendingVideo,
@@ -2164,31 +2338,35 @@ fn spawn_video_processing(
             }
         };
         let ffmpeg = std::env::var("FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned());
-        if let Err(status) = generate_video_poster(
-            &ffmpeg,
-            &pending.source_path,
-            &pending.output_directory,
-            pending.duration_us,
-        )
-        .await
-        {
-            tracing::warn!(
-                %video_id,
-                %status,
-                "Unable to generate the early video poster; transcoding will retry"
-            );
-        } else {
-            tracing::info!(%video_id, "Generated video poster before HLS transcoding");
-        }
-
+        let poster_source = pending.source_path.clone();
+        let poster_directory = pending.output_directory.clone();
+        let poster_duration = pending.duration_us;
+        let poster_task = tokio::spawn(async move {
+            if let Err(status) = generate_video_poster(
+                &ffmpeg,
+                &poster_source,
+                &poster_directory,
+                poster_duration,
+            )
+            .await
+            {
+                tracing::warn!(%video_id, %status, "Unable to generate early video poster");
+            } else {
+                tracing::info!(%video_id, "Generated video poster during processing");
+            }
+        });
         let result = transcode_video_to_hls(
             &db,
+            &video_tx,
+            &redis,
+            pending.user_id,
             video_id,
             &pending.source_path,
             &pending.output_directory,
             pending.duration_us,
         )
         .await;
+        let _ = poster_task.await;
         let (status, error) = match result {
             Ok(()) => ("ready", None),
             Err(status) => {
@@ -2214,12 +2392,31 @@ fn spawn_video_processing(
         {
             tracing::error!(%db_error, %video_id, "Failed to save video processing status");
         }
+        let _ = video_tx.send(VideoProgressBroadcast {
+            event_type: "video_progress",
+            user_id: pending.user_id,
+            video_id,
+            status: status.to_owned(),
+            progress: if status == "ready" { 100 } else { 0 },
+        });
+        let event = VideoProgressBroadcast {
+            event_type: "video_progress",
+            user_id: pending.user_id,
+            video_id,
+            status: status.to_owned(),
+            progress: if status == "ready" { 100 } else { 0 },
+        };
+        let mut redis = redis;
+        store_video_progress(&mut redis, &event).await;
     });
 }
 
 fn spawn_uploaded_video_processing(
     db: PgPool,
+    video_tx: tokio::sync::broadcast::Sender<VideoProgressBroadcast>,
+    redis: redis::aio::MultiplexedConnection,
     transcode_slots: Arc<Semaphore>,
+    user_id: Uuid,
     video_id: Uuid,
     source_path: PathBuf,
     output_directory: PathBuf,
@@ -2231,6 +2428,8 @@ fn spawn_uploaded_video_processing(
             Err(status) => {
                 mark_video_processing_failed(
                     &db,
+                    &video_tx,
+                    user_id,
                     video_id,
                     format!("Unable to inspect the uploaded video ({status})."),
                 )
@@ -2251,6 +2450,8 @@ fn spawn_uploaded_video_processing(
                 tracing::error!(%error, %video_id, "Failed to read uploaded video metadata");
                 mark_video_processing_failed(
                     &db,
+                    &video_tx,
+                    user_id,
                     video_id,
                     "Unable to read the uploaded video.".to_owned(),
                 )
@@ -2287,9 +2488,12 @@ fn spawn_uploaded_video_processing(
                 tracing::info!(%video_id, "Uploaded video marked as processing");
                 spawn_video_processing(
                     db,
+                    video_tx.clone(),
+                    redis.clone(),
                     transcode_slots,
                     video_id,
                     PendingVideo {
+                        user_id,
                         source_path,
                         output_directory,
                         duration_us: metadata.duration_us,
@@ -2306,6 +2510,8 @@ fn spawn_uploaded_video_processing(
                 tracing::error!(%error, %video_id, "Failed to finalize uploaded video");
                 mark_video_processing_failed(
                     &db,
+                    &video_tx,
+                    user_id,
                     video_id,
                     "Unable to prepare the uploaded video.".to_owned(),
                 )
@@ -2315,7 +2521,13 @@ fn spawn_uploaded_video_processing(
     });
 }
 
-async fn mark_video_processing_failed(db: &PgPool, video_id: Uuid, error: String) {
+async fn mark_video_processing_failed(
+    db: &PgPool,
+    video_tx: &tokio::sync::broadcast::Sender<VideoProgressBroadcast>,
+    user_id: Uuid,
+    video_id: Uuid,
+    error: String,
+) {
     if let Err(db_error) = sqlx::query(
         r#"
         UPDATE video
@@ -2332,10 +2544,20 @@ async fn mark_video_processing_failed(db: &PgPool, video_id: Uuid, error: String
     {
         tracing::error!(%db_error, %video_id, "Failed to save video upload failure");
     }
+    let _ = video_tx.send(VideoProgressBroadcast {
+        event_type: "video_progress",
+        user_id,
+        video_id,
+        status: "failed".to_owned(),
+        progress: 0,
+    });
 }
 
 async fn transcode_video_to_hls(
     db: &PgPool,
+    video_tx: &tokio::sync::broadcast::Sender<VideoProgressBroadcast>,
+    redis: &redis::aio::MultiplexedConnection,
+    user_id: Uuid,
     video_id: Uuid,
     source_path: &FsPath,
     output_directory: &FsPath,
@@ -2354,9 +2576,9 @@ async fn transcode_video_to_hls(
         .arg(source_path)
         .args([
             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
-            "-preset", "veryfast", "-crf", "23",
+            "-preset", "medium", "-crf", "20",
             "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-pix_fmt", "yuv420p", "-maxrate", "5M", "-bufsize", "10M",
+            "-pix_fmt", "yuv420p", "-maxrate", "6M", "-bufsize", "12M",
             "-c:a", "aac", "-b:a", "128k",
             "-ar", "48000", "-ac", "2",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
@@ -2374,7 +2596,7 @@ async fn transcode_video_to_hls(
             tracing::error!(%error, executable = %ffmpeg, "Failed to start FFmpeg for video");
             StatusCode::SERVICE_UNAVAILABLE
         })?;
-    update_processing_progress(db, video_id, 1).await;
+    update_processing_progress(db, video_tx, redis, user_id, video_id, 1).await;
     tracing::info!(%video_id, executable = %ffmpeg, "Started FFmpeg video HLS transcoding");
     let stdout = child
         .stdout
@@ -2391,6 +2613,9 @@ async fn transcode_video_to_hls(
     });
     let mut lines = BufReader::new(stdout).lines();
     let mut last_progress = 0_i16;
+    let mut last_progress_update = Instant::now()
+        .checked_sub(StdDuration::from_secs(2))
+        .unwrap_or_else(Instant::now);
     while let Some(line) = lines
         .next_line()
         .await
@@ -2400,9 +2625,13 @@ async fn transcode_video_to_hls(
             continue;
         };
         let progress = ((out_time_us.saturating_mul(99) / duration_us.max(1)).min(99)) as i16;
-        if progress > last_progress {
+        let should_update = progress > last_progress
+            && (progress >= 99
+                || last_progress_update.elapsed() >= StdDuration::from_millis(750));
+        if should_update {
             last_progress = progress;
-            update_processing_progress(db, video_id, progress).await;
+            last_progress_update = Instant::now();
+            update_processing_progress(db, video_tx, redis, user_id, video_id, progress).await;
         }
     }
     let status = child
@@ -2418,8 +2647,6 @@ async fn transcode_video_to_hls(
         );
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
-    tracing::info!(%video_id, "FFmpeg video HLS transcoding completed; generating poster");
-    generate_video_poster(&ffmpeg, source_path, output_directory, duration_us).await?;
     Ok(())
 }
 
@@ -2429,7 +2656,14 @@ fn parse_ffmpeg_out_time_us(line: &str) -> Option<u64> {
         .and_then(|value| value.parse::<u64>().ok())
 }
 
-async fn update_processing_progress(db: &PgPool, video_id: Uuid, progress: i16) {
+async fn update_processing_progress(
+    db: &PgPool,
+    video_tx: &tokio::sync::broadcast::Sender<VideoProgressBroadcast>,
+    redis: &redis::aio::MultiplexedConnection,
+    user_id: Uuid,
+    video_id: Uuid,
+    progress: i16,
+) {
     if let Err(error) = sqlx::query(
         r#"
         UPDATE video
@@ -2445,6 +2679,16 @@ async fn update_processing_progress(db: &PgPool, video_id: Uuid, progress: i16) 
     {
         tracing::warn!(%error, %video_id, %progress, "Failed to save video progress");
     }
+    let event = VideoProgressBroadcast {
+        event_type: "video_progress",
+        user_id,
+        video_id,
+        status: "processing".to_owned(),
+        progress,
+    };
+    let _ = video_tx.send(event.clone());
+    let mut redis = redis.clone();
+    store_video_progress(&mut redis, &event).await;
 }
 
 async fn generate_video_poster(

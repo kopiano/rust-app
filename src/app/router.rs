@@ -17,7 +17,7 @@ use tower_http::{services::ServeDir, set_header::SetResponseHeaderLayer};
 const MAX_MOMENT_BODY_BYTES: usize = 2 * 1024 * 1024 * 1024 + 16 * 1024 * 1024;
 const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 6 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
-const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 1024 * 1024 + 64 * 1024;
+const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 const NO_STORE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
 const ASSET_CACHE_CONTROL: &str = "public, max-age=2592000";
 
@@ -304,6 +304,7 @@ fn music_api(state: AppState) -> Router<AppState> {
 fn video_api(state: AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/video", get(video::list))
+        .route("/video/banner", get(video::banner))
         .route("/video/categories", get(video::categories))
         .route("/video/collections", get(video::collections))
         .route("/video/{id}", get(video::get))
@@ -317,6 +318,7 @@ fn video_api(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route("/video/uploads", post(video::create_upload))
         .route("/video/uploads/{upload_id}", get(video::upload_status))
+        .route("/video/status", get(video::status_websocket))
         .route(
             "/video/uploads/{upload_id}/chunk",
             put(video::upload_chunk)

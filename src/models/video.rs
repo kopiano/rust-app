@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, types::Json};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VideoProgressBroadcast {
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+    pub user_id: Uuid,
+    pub video_id: Uuid,
+    pub status: String,
+    pub progress: i16,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct VideoCategory {
     pub id: Uuid,
@@ -68,9 +78,47 @@ pub struct VideoListItem {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct VideoBannerItem {
+    pub cover_url: String,
+    pub duration: i32,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub view_count: i64,
+    pub username: String,
+    pub avatar: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct VideoListPage {
     pub items: Vec<VideoListItem>,
+    pub has_more: bool,
+    pub next_before_created_at: Option<DateTime<Utc>>,
+    pub next_before_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct VideoHomeListItem {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub cover_url: String,
+    pub duration: i32,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub status: String,
+    pub processing_progress: i16,
+    pub view_count: i64,
+    pub like_count: i64,
+    #[serde(skip)]
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VideoHomeListPage {
+    pub items: Vec<VideoHomeListItem>,
     pub has_more: bool,
     pub next_before_created_at: Option<DateTime<Utc>>,
     pub next_before_id: Option<Uuid>,

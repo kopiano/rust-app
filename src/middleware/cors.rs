@@ -14,6 +14,8 @@ pub fn cors() -> CorsLayer {
             "http://127.0.0.1:3000".parse::<HeaderValue>().unwrap(),
             "https://kopiano.cc".parse::<HeaderValue>().unwrap(),
             "https://a.kopiano.cc".parse::<HeaderValue>().unwrap(),
+            "http://localhost:4173".parse::<HeaderValue>().unwrap(),
+            "http://127.0.0.1:4173".parse::<HeaderValue>().unwrap(),
         ])
         .allow_headers([
             AUTHORIZATION,

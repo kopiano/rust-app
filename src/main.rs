@@ -31,6 +31,7 @@ async fn main() {
     let redis = redis::connect().await;
     tracing::info!(target: "app::redis", "Redis connected");
     let (music_tx, _) = tokio::sync::broadcast::channel(256);
+    let (video_tx, _) = tokio::sync::broadcast::channel(512);
     let limits = Arc::new(app::runtime::RuntimeLimits::from_env());
     let metrics = Arc::new(app::runtime::AppMetrics::default());
     let message_hub = Arc::new(services::message_hub::MessageHub::from_env());
@@ -96,6 +97,7 @@ async fn main() {
             .filter(|value| !value.trim().is_empty()),
         message_hub,
         music_tx,
+        video_tx,
         limits,
         metrics,
     };
