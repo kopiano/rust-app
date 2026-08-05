@@ -2578,7 +2578,7 @@ async fn transcode_video_to_hls(
             "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264",
             "-preset", "medium", "-crf", "20",
             "-vf", "scale=w='min(1920,iw)':h='min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
-            "-pix_fmt", "yuv420p", "-maxrate", "6M", "-bufsize", "12M",
+            "-pix_fmt", "yuv420p", "-maxrate", "8M", "-bufsize", "16M",
             "-c:a", "aac", "-b:a", "128k",
             "-ar", "48000", "-ac", "2",
             "-force_key_frames", "expr:gte(t,n_forced*2)",
