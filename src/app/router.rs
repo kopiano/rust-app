@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::handles::{
-    auth, character, message, moment, music, subscription, system, task, user, video, voice,
+    auth, character, docs, message, moment, music, subscription, system, task, user, video, voice,
     voice_training,
 };
 use crate::middleware::{concurrency, cors, jwt, logger, plan};
@@ -41,6 +41,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(task_api(state.clone()))
         .merge(character_api(state.clone()))
         .merge(voice_api(state.clone()))
+        .merge(docs_api(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             concurrency::limit_http,
@@ -93,6 +94,15 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .service(ServeDir::new(asset_directory("music"))),
         )
+        .nest_service(
+            "/api/assets/docs-image",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
+                ))
+                .service(ServeDir::new(asset_directory("docs-image"))),
+        )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
         .layer(cors::cors())
@@ -119,6 +129,8 @@ fn system_api() -> Router<AppState> {
         .route("/health", get(system::health))
         .route("/metrics", get(system::metrics))
 }
+
+
 
 fn user_api(state: AppState) -> Router<AppState> {
     Router::new()
@@ -389,4 +401,16 @@ fn subscription_api(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/subscription/webhook", post(subscription::webhook))
         .merge(authenticated)
+}
+
+fn docs_api(state: AppState) -> Router<AppState> {
+    let public = Router::new()
+        .route("/docs", get(docs::list))
+        .route_layer(middleware::from_fn_with_state(state.clone(), jwt::optional_auth));
+    let authenticated = Router::new()
+        .route("/docs", post(docs::create_dispatch).layer(DefaultBodyLimit::max(12 * 1024 * 1024)).layer(middleware::from_fn_with_state(state.clone(), concurrency::limit_upload)))
+        .route("/docs/{id}", get(docs::get).put(docs::update).patch(docs::update_info).delete(docs::delete))
+        .layer(DefaultBodyLimit::max(11 * 1024 * 1024))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new().merge(public).merge(authenticated)
 }

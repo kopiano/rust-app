@@ -28,6 +28,9 @@ async fn main() {
         .run(&pool)
         .await
         .expect("Database migration failed");
+    handles::docs::backfill_content(&pool)
+        .await
+        .expect("Document content backfill failed");
     let redis = redis::connect().await;
     tracing::info!(target: "app::redis", "Redis connected");
     let (music_tx, _) = tokio::sync::broadcast::channel(256);

@@ -1,0 +1,2 @@
+ALTER TABLE docs DROP CONSTRAINT IF EXISTS docs_user_slug_unique;
+ALTER TABLE docs DROP COLUMN IF EXISTS slug;
