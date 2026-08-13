@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json,
-    extract::{FromRequest, Multipart, Path, Request, State},
+    extract::{FromRequest, Multipart, Path, Query, Request, State},
     http::StatusCode,
 };
 use image::{ImageFormat, imageops::FilterType};
@@ -59,19 +59,41 @@ pub struct DocListItem {
     pub image: Option<String>,
     pub accent: String,
     pub content: String,
+    pub public: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DocsListQuery {
+    #[serde(default)]
+    pub public: bool,
 }
 
 pub async fn list(
     State(state): State<AppState>,
+    Query(query): Query<DocsListQuery>,
     claims: Option<Extension<Claims>>,
 ) -> Result<Json<ApiResponse<Vec<DocListItem>>>, StatusCode> {
+    if query.public {
+        let docs = sqlx::query_as::<_, DocListItem>(
+            r#"SELECT id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
+                      image_url AS image, 'violet' AS accent, content, public
+               FROM docs
+               WHERE public = TRUE
+               ORDER BY updated_at DESC"#,
+        )
+        .fetch_all(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(ApiResponse::success(docs)));
+    }
+
     let Some(Extension(claims)) = claims else {
         return Ok(Json(ApiResponse::success(Vec::new())));
     };
     let user_id = user_id(&claims)?;
     let docs = sqlx::query_as::<_, DocListItem>(
         r#"SELECT id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                  image_url AS image, 'violet' AS accent, content
+                  image_url AS image, 'violet' AS accent, content, public
            FROM docs WHERE user_id = $1 ORDER BY updated_at DESC"#,
     )
     .bind(user_id)
@@ -124,7 +146,7 @@ pub async fn create(
     let title = title.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
     let content = content.unwrap_or_default();
     let category = category.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
-    let slug = slugify(&title);
+    let slug = title_slugify(&title);
     let username_slug = slugify(&username);
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs").join(&username_slug);
     fs::create_dir_all(&directory).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -208,7 +230,7 @@ pub async fn create(
         r#"INSERT INTO docs (user_id, title, category, content, markdown_path, image_url)
            VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                     image_url AS image, 'violet' AS accent, content"#,
+                     image_url AS image, 'violet' AS accent, content, public"#,
     )
     .bind(user_id)
     .bind(&title)
@@ -274,7 +296,7 @@ pub async fn create_dispatch(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)?;
     let user_slug = slugify(&username);
-    let slug = slugify(&title);
+    let slug = title_slugify(&title);
     let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src/assets/docs")
         .join(&user_slug);
@@ -334,16 +356,19 @@ pub struct DocContent {
     pub category: String,
     pub image: Option<String>,
     pub content: String,
+    pub public: bool,
 }
 
 pub async fn get(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    claims: Option<Extension<Claims>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<DocContent>>, StatusCode> {
-    let user_id = user_id(&claims)?;
-    let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String)>(
-        "SELECT id, title, category, image_url, markdown_path, content FROM docs WHERE id = $1 AND user_id = $2",
+    let user_id = claims.as_ref().map(|Extension(claims)| user_id(claims)).transpose()?;
+    let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String, bool)>(
+        r#"SELECT id, title, category, image_url, markdown_path, content, public
+           FROM docs
+           WHERE id = $1 AND (public = TRUE OR ($2::uuid IS NOT NULL AND user_id = $2))"#,
     )
     .bind(id)
     .bind(user_id)
@@ -357,6 +382,7 @@ pub async fn get(
         category: row.2,
         image: row.3,
         content: row.5,
+        public: row.6,
     })))
 }
 
@@ -370,6 +396,7 @@ pub async fn update_info(
     let mut title = None;
     let mut category = None;
     let mut image = None;
+    let mut public: Option<bool> = None;
     while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
         let name = field.name().unwrap_or_default().to_string();
         if name == "image" {
@@ -384,6 +411,7 @@ pub async fn update_info(
             match name.as_str() {
                 "title" => title = Some(value.trim().to_string()),
                 "category" => category = Some(value.trim().to_string()),
+                "public" => public = Some(value.parse::<bool>().map_err(|_| StatusCode::BAD_REQUEST)?),
                 _ => {}
             }
         }
@@ -393,7 +421,11 @@ pub async fn update_info(
     let image_url = if let Some(bytes) = image {
         let decoded = image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let resized = decoded.resize_to_fill(720, 480, FilterType::Lanczos3);
-        let image_name = format!("{}-{}.webp", slugify(&username_for_doc(&state.db, user_id).await?), slugify(&title));
+        let image_name = format!(
+            "{}-{}.webp",
+            slugify(&username_for_doc(&state.db, user_id).await?),
+            title_slugify(&title),
+        );
         let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-image");
         fs::create_dir_all(&image_dir).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let image_path = image_dir.join(&image_name);
@@ -404,15 +436,16 @@ pub async fn update_info(
     } else {
         None
     };
-    let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String)>(
-        r#"UPDATE docs SET title = $2, category = $3, image_url = COALESCE($4, image_url), updated_at = NOW()
-           WHERE id = $1 AND user_id = $5
-           RETURNING id, title, category, image_url, markdown_path, content"#,
+    let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String, bool)>(
+        r#"UPDATE docs SET title = $2, category = $3, image_url = COALESCE($4, image_url),
+               public = COALESCE($5, public), updated_at = NOW()
+           WHERE id = $1 AND user_id = $6
+           RETURNING id, title, category, image_url, markdown_path, content, public"#,
     )
-    .bind(id).bind(&title).bind(&category).bind(&image_url).bind(user_id)
+    .bind(id).bind(&title).bind(&category).bind(&image_url).bind(&public).bind(user_id)
     .fetch_optional(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ApiResponse::success(DocContent { id: row.0, title: row.1, category: row.2, image: row.3, content: row.5 })))
+    Ok(Json(ApiResponse::success(DocContent { id: row.0, title: row.1, category: row.2, image: row.3, content: row.5, public: row.6 })))
 }
 
 pub async fn delete(
@@ -518,6 +551,21 @@ fn slugify(value: &str) -> String {
     } else {
         slug.chars().take(80).collect()
     }
+}
+
+fn title_slugify(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len() * 2);
+
+    for character in value.chars() {
+        match character {
+            '+' => normalized.push_str(" plus "),
+            '#' => normalized.push_str(" sharp "),
+            '&' => normalized.push_str(" and "),
+            _ => normalized.push(character),
+        }
+    }
+
+    slugify(&normalized)
 }
 
 fn timestamp() -> u64 {

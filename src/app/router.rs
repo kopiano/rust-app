@@ -406,10 +406,11 @@ fn subscription_api(state: AppState) -> Router<AppState> {
 fn docs_api(state: AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/docs", get(docs::list))
+        .route("/docs/{id}", get(docs::get))
         .route_layer(middleware::from_fn_with_state(state.clone(), jwt::optional_auth));
     let authenticated = Router::new()
         .route("/docs", post(docs::create_dispatch).layer(DefaultBodyLimit::max(12 * 1024 * 1024)).layer(middleware::from_fn_with_state(state.clone(), concurrency::limit_upload)))
-        .route("/docs/{id}", get(docs::get).put(docs::update).patch(docs::update_info).delete(docs::delete))
+        .route("/docs/{id}", put(docs::update).patch(docs::update_info).delete(docs::delete))
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new().merge(public).merge(authenticated)
