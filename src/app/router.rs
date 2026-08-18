@@ -7,7 +7,10 @@ use crate::middleware::{concurrency, cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{HeaderValue, header::CACHE_CONTROL},
+    http::{
+        HeaderName, HeaderValue,
+        header::CACHE_CONTROL,
+    },
     middleware,
     routing::{delete, get, patch, post, put},
 };
@@ -19,7 +22,8 @@ const MAX_MUSIC_BODY_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_VIDEO_BODY_BYTES: usize = 6 * 1024 * 1024 * 1024 + 32 * 1024 * 1024;
 const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 const NO_STORE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
-const ASSET_CACHE_CONTROL: &str = "public, max-age=2592000";
+const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const CDN_CACHE_CONTROL: &str = "public, max-age=31536000";
 
 fn asset_directory(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -82,6 +86,14 @@ pub fn create_router(state: AppState) -> Router {
                 .layer(SetResponseHeaderLayer::overriding(
                     CACHE_CONTROL,
                     HeaderValue::from_static(ASSET_CACHE_CONTROL),
+                ))
+                .layer(SetResponseHeaderLayer::overriding(
+                    HeaderName::from_static("cloudflare-cdn-cache-control"),
+                    HeaderValue::from_static(CDN_CACHE_CONTROL),
+                ))
+                .layer(SetResponseHeaderLayer::overriding(
+                    HeaderName::from_static("accept-ranges"),
+                    HeaderValue::from_static("bytes"),
                 ))
                 .service(ServeDir::new(asset_directory("video"))),
         )
