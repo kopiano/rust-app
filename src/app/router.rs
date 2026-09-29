@@ -115,6 +115,10 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .service(ServeDir::new(asset_directory("docs-image"))),
         )
+         .nest_service(
+              "/api/assets/piano",
+              ServeDir::new(asset_directory("piano")),
+         )
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
         .layer(cors::cors())
