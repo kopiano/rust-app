@@ -1,7 +1,7 @@
-use axum::{Extension, Json, extract::{Multipart, State}, http::StatusCode};
+use axum::{Extension, Json, extract::{Multipart, Path, State}, http::StatusCode};
 use image::{ImageFormat, imageops::FilterType};
 use sha2::{Digest, Sha256};
-use std::{io::Cursor, path::Path};
+use std::{io::Cursor, path::Path as FilePath};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -17,6 +17,94 @@ pub struct StoreProduct {
     price: i32,
     sales: i32,
     image_url: String,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct StoreCartItem {
+    id: Uuid,
+    product_id: Uuid,
+    size: String,
+    temperature: String,
+    sweetness: String,
+    quantity: i32,
+}
+
+#[derive(serde::Deserialize)]
+pub struct CartItemInput {
+    product_id: Uuid,
+    size: String,
+    temperature: String,
+    sweetness: String,
+    quantity: i32,
+}
+
+fn valid_cart_input(input: &CartItemInput) -> bool {
+    matches!(input.size.as_str(), "small" | "medium" | "large")
+        && matches!(input.temperature.as_str(), "iced" | "hot" | "room")
+        && matches!(input.sweetness.as_str(), "standard" | "less" | "extra" | "none")
+        && (1..=99).contains(&input.quantity)
+}
+
+pub async fn cart_list(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<ApiResponse<Vec<StoreCartItem>>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let items = sqlx::query_as::<_, StoreCartItem>(
+        "SELECT id, product_id, size, temperature, sweetness, quantity
+         FROM store_cart WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
+    ).bind(user_id).fetch_all(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ApiResponse::success(items)))
+}
+
+pub async fn cart_upsert(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<CartItemInput>,
+) -> Result<Json<ApiResponse<StoreCartItem>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    if !valid_cart_input(&input) { return Err(StatusCode::BAD_REQUEST); }
+    let item = sqlx::query_as::<_, StoreCartItem>(
+        "INSERT INTO store_cart (id, user_id, product_id, size, temperature, sweetness, quantity)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+         WHERE EXISTS (SELECT 1 FROM store WHERE id = $3)
+         ON CONFLICT (user_id, product_id, size, temperature, sweetness)
+         DO UPDATE SET quantity = LEAST(99, store_cart.quantity + EXCLUDED.quantity), updated_at = NOW()
+         RETURNING id, product_id, size, temperature, sweetness, quantity",
+    ).bind(Uuid::new_v4()).bind(user_id).bind(input.product_id).bind(input.size)
+        .bind(input.temperature).bind(input.sweetness).bind(input.quantity)
+        .fetch_optional(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ApiResponse::success(item)))
+}
+
+pub async fn cart_update(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+    Json(input): Json<serde_json::Value>,
+) -> Result<Json<ApiResponse<StoreCartItem>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let quantity = input.get("quantity").and_then(|v| v.as_i64()).ok_or(StatusCode::BAD_REQUEST)?;
+    if !(1..=99).contains(&quantity) { return Err(StatusCode::BAD_REQUEST); }
+    let item = sqlx::query_as::<_, StoreCartItem>(
+        "UPDATE store_cart SET quantity = $1, updated_at = NOW()
+         WHERE id = $2 AND user_id = $3
+         RETURNING id, product_id, size, temperature, sweetness, quantity",
+    ).bind(quantity as i32).bind(id).bind(user_id).fetch_optional(&state.db)
+        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(ApiResponse::success(item)))
+}
+
+pub async fn cart_delete(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<()>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    sqlx::query("DELETE FROM store_cart WHERE id = $1 AND user_id = $2")
+        .bind(id).bind(user_id).execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ApiResponse::success(())))
 }
 
 pub async fn list(State(state): State<AppState>) -> Result<Json<ApiResponse<Vec<StoreProduct>>>, StatusCode> {
@@ -73,7 +161,7 @@ pub async fn create(
     let id = Uuid::new_v4();
     let image_filename = store_image_filename(&encoded);
     let image_url = format!("/api/assets/store/{image_filename}");
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = FilePath::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/assets/store").join(&image_filename);
     tokio::fs::create_dir_all(path.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?)
         .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

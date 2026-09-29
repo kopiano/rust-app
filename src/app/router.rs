@@ -142,6 +142,9 @@ async fn root() -> &'static str {
 fn store_api(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route("/store/products", post(store::create))
+        .route("/store/cart", get(store::cart_list))
+        .route("/store/cart/items", post(store::cart_upsert))
+        .route("/store/cart/items/{id}", patch(store::cart_update).delete(store::cart_delete))
         .layer(DefaultBodyLimit::max(12 * 1024 * 1024 + 64 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new()
