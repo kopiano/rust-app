@@ -1,6 +1,6 @@
 use crate::app::AppState;
 use crate::handles::{
-    auth, character, docs, message, moment, music, subscription, system, task, user, video, voice,
+    auth, character, docs, message, moment, music, store, subscription, system, task, user, video, voice,
     voice_training,
 };
 use crate::middleware::{concurrency, cors, jwt, logger, plan};
@@ -46,6 +46,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(character_api(state.clone()))
         .merge(voice_api(state.clone()))
         .merge(docs_api(state.clone()))
+        .merge(store_api(state.clone()))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             concurrency::limit_http,
@@ -115,6 +116,15 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .service(ServeDir::new(asset_directory("docs-image"))),
         )
+        .nest_service(
+            "/api/assets/store",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
+                ))
+                .service(ServeDir::new(asset_directory("store"))),
+        )
          .nest_service(
               "/api/assets/piano",
               ServeDir::new(asset_directory("piano")),
@@ -127,6 +137,16 @@ pub fn create_router(state: AppState) -> Router {
 
 async fn root() -> &'static str {
     "Hello, World!"
+}
+
+fn store_api(state: AppState) -> Router<AppState> {
+    let authenticated = Router::new()
+        .route("/store/products", post(store::create))
+        .layer(DefaultBodyLimit::max(12 * 1024 * 1024 + 64 * 1024))
+        .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
+    Router::new()
+        .route("/store/products", get(store::list))
+        .merge(authenticated)
 }
 
 fn auth_api() -> Router<AppState> {

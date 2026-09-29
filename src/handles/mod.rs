@@ -5,6 +5,7 @@ pub mod message;
 pub mod moment;
 pub mod music;
 pub mod subscription;
+pub mod store;
 pub mod system;
 pub mod task;
 pub mod user;
