@@ -25,7 +25,8 @@ const TENCENT_DAILY_URL: &str = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 const STOCK_CACHE_TTL: Duration = Duration::from_secs(45);
 const STOCK_STALE_TTL: Duration = Duration::from_secs(5 * 60);
 const STOCK_BATCH_CONCURRENCY: usize = 12;
-const STOCK_PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+const STOCK_PROVIDER_TIMEOUT: Duration = Duration::from_millis(175);
+const STOCK_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const STOCK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,6 +239,7 @@ pub struct StockResponse {
     pub previous_close: Option<f64>,
     pub change: Option<f64>,
     pub percent: Option<f64>,
+    pub volume: Option<f64>,
     pub market_cap: Option<f64>,
     pub as_of: Option<String>,
     pub points: Vec<StockPoint>,
@@ -444,9 +446,7 @@ async fn fetch_stock_normalized(
         return Ok(entry.response.clone());
     }
 
-    if let Some(entry) = stale.as_ref()
-        && entry.fetched_at.elapsed() < STOCK_STALE_TTL
-    {
+    if let Some(entry) = stale.as_ref() {
         spawn_refresh(
             state.clone(),
             symbol.to_string(),
@@ -589,21 +589,19 @@ async fn preload_db_cache(db: &sqlx::PgPool, symbols: &[String], range: &str, in
     let mut cache = stock_cache().write().await;
     for row in rows {
         let age = Duration::from_secs((now - row.fetched_at).num_seconds().max(0) as u64);
-        if age < STOCK_STALE_TTL {
-            let cache_key = format!("{}:{}:{}", row.symbol, row.range, row.interval);
-            let should_insert = cache
-                .get(&cache_key)
-                .map(|entry| entry.fetched_at.elapsed() > age)
-                .unwrap_or(true);
-            if should_insert {
-                cache.insert(
-                    cache_key,
-                    CachedStock {
-                        response: row.response.0,
-                        fetched_at: Instant::now() - age,
-                    },
-                );
-            }
+        let cache_key = format!("{}:{}:{}", row.symbol, row.range, row.interval);
+        let should_insert = cache
+            .get(&cache_key)
+            .map(|entry| entry.fetched_at.elapsed() > age)
+            .unwrap_or(true);
+        if should_insert {
+            cache.insert(
+                cache_key,
+                CachedStock {
+                    response: row.response.0,
+                    fetched_at: Instant::now() - age,
+                },
+            );
         }
     }
 }
@@ -667,9 +665,6 @@ async fn load_db_cache(
     .flatten()?;
 
     let age = Duration::from_secs((Utc::now() - row.fetched_at).num_seconds().max(0) as u64);
-    if age >= STOCK_STALE_TTL {
-        return None;
-    }
     let entry = CachedStock {
         response: row.response.0,
         fetched_at: Instant::now() - age,
@@ -698,15 +693,24 @@ async fn spawn_refresh(
     }
     let source_interval = source_interval.to_string();
     tokio::spawn(async move {
-        let result = fetch_remote_stock(
-            &state,
-            &symbol,
-            &range,
-            &interval,
-            &source_interval,
-            bucket_minutes,
+        let result = tokio::time::timeout(
+            STOCK_REFRESH_TIMEOUT,
+            fetch_remote_stock(
+                &state,
+                &symbol,
+                &range,
+                &interval,
+                &source_interval,
+                bucket_minutes,
+            ),
         )
-        .await;
+        .await
+        .unwrap_or_else(|_| {
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "stock data provider timed out".to_string(),
+            ))
+        });
         if let Ok(response) = result {
             save_stock_cache(&state, &cache_key, &symbol, &range, &interval, &response).await;
         }
@@ -848,7 +852,7 @@ async fn fetch_tencent_stock(
         _ => format!("sh{}", symbol.trim_end_matches(".SS")),
     }
     .to_lowercase();
-    let (points, price, previous_close) =
+    let (points, price, previous_close, volume) =
         if is_cn_hk_symbol(symbol) && (range == "1d" || range == "5d") {
             let source_interval = if range == "1d" && interval == "1m" {
                 "m1"
@@ -909,7 +913,10 @@ async fn fetch_tencent_stock(
             let previous_close = quote
                 .and_then(|values| values.get(4))
                 .and_then(parse_number);
-            (points, price, previous_close)
+            let volume = quote
+                .and_then(|values| values.get(6))
+                .and_then(parse_number);
+            (points, price, previous_close, volume)
         } else {
             let url = format!("{TENCENT_DAILY_URL}?param={quote_symbol},day,,,320,1");
             let payload = fetch_json(state, url, "Tencent daily").await?;
@@ -959,7 +966,12 @@ async fn fetch_tencent_stock(
                 });
             }
             let points = all_points;
-            (points, price, previous_close)
+            let volume = rows
+                .last()
+                .and_then(|row| row.as_array())
+                .and_then(|values| values.get(5))
+                .and_then(parse_number);
+            (points, price, previous_close, volume)
         };
     let change = price
         .zip(previous_close)
@@ -981,6 +993,7 @@ async fn fetch_tencent_stock(
         previous_close,
         change,
         percent,
+        volume,
         market_cap: None,
         as_of: Some(Utc::now().to_rfc3339()),
         points,
@@ -1046,6 +1059,7 @@ async fn fetch_yahoo_stock(
     let quote = result["indicators"]["quote"].get(0).unwrap_or(&Value::Null);
     let timestamps = result["timestamp"].as_array().cloned().unwrap_or_default();
     let closes = quote["close"].as_array().cloned().unwrap_or_default();
+    let volumes = quote["volume"].as_array().cloned().unwrap_or_default();
     let points = timestamps
         .iter()
         .zip(closes.iter())
@@ -1074,6 +1088,10 @@ async fn fetch_yahoo_stock(
     let percent = change
         .zip(previous_close)
         .and_then(|(change, previous)| (previous != 0.0).then_some(change / previous * 100.0));
+    let volume = volumes
+        .iter()
+        .rev()
+        .find_map(Value::as_f64);
     let catalog = CATALOG.iter().find(|item| item.symbol == symbol);
 
     Ok(StockResponse {
@@ -1093,6 +1111,7 @@ async fn fetch_yahoo_stock(
         previous_close,
         change,
         percent,
+        volume,
         market_cap: meta["marketCap"].as_f64(),
         as_of: meta["regularMarketTime"].as_i64().and_then(|timestamp| {
             DateTime::<Utc>::from_timestamp(timestamp, 0).map(|date| date.to_rfc3339())
@@ -1163,6 +1182,7 @@ async fn fetch_nasdaq_stock(
                 (previous != 0.0).then_some(change / previous * 100.0)
             })
         });
+    let volume = data.get("volume").and_then(parse_number);
     let points = data
         .get("chart")
         .and_then(Value::as_array)
@@ -1196,6 +1216,7 @@ async fn fetch_nasdaq_stock(
         previous_close,
         change,
         percent,
+        volume,
         market_cap: None,
         as_of: Some(Utc::now().to_rfc3339()),
         points,
