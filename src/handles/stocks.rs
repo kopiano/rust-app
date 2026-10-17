@@ -25,6 +25,8 @@ const TENCENT_DAILY_URL: &str = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 const STOCK_CACHE_TTL: Duration = Duration::from_secs(45);
 const STOCK_STALE_TTL: Duration = Duration::from_secs(5 * 60);
 const STOCK_BATCH_CONCURRENCY: usize = 12;
+const STOCK_PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+const STOCK_BATCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StockCatalogItem {
@@ -292,9 +294,9 @@ pub async fn list(
     State(state): State<AppState>,
     Query(query): Query<StockQuery>,
 ) -> Result<Json<Vec<StockResponse>>, (StatusCode, String)> {
-    let validated_range = normalize_range(query.range.as_deref())?;
+    let validated_range = normalize_range(query.range.as_deref())?.to_string();
     let (validated_interval, source_interval, bucket_minutes) =
-        normalize_interval(validated_range, query.interval.as_deref())?;
+        normalize_interval(&validated_range, query.interval.as_deref())?;
     let requested_symbols = query.symbols.clone().unwrap_or_else(|| {
         CATALOG
             .iter()
@@ -316,41 +318,55 @@ pub async fn list(
         ));
     }
 
-    preload_db_cache(&state.db, &symbols, validated_range, validated_interval).await;
+    preload_db_cache(&state.db, &symbols, &validated_range, validated_interval).await;
 
-    let responses = futures_util::stream::iter(symbols.into_iter().enumerate().map(
-        |(index, symbol)| {
+    let batch_limiter = Arc::new(tokio::sync::Semaphore::new(STOCK_BATCH_CONCURRENCY));
+    let mut responses: futures_util::stream::FuturesUnordered<_> = symbols
+        .into_iter()
+        .enumerate()
+        .map(|(index, symbol)| {
             let state = state.clone();
-            async move {
+            let batch_limiter = Arc::clone(&batch_limiter);
+            let range = validated_range.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = batch_limiter.acquire_owned().await else {
+                    return (
+                        index,
+                        Err((
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "stock batch capacity unavailable".to_string(),
+                        )),
+                    );
+                };
                 (
                     index,
                     fetch_stock_normalized(
                         &state,
                         &symbol,
-                        validated_range,
+                        &range,
                         validated_interval,
                         source_interval,
                         bucket_minutes,
                     )
                     .await,
                 )
-            }
-        },
-    ))
-    .buffer_unordered(STOCK_BATCH_CONCURRENCY)
-    .filter_map(|result| async move {
-        match result {
-            (index, Ok(response)) => Some((index, response)),
-            (index, Err((status, message))) => {
+            })
+        })
+        .collect();
+    let deadline = tokio::time::Instant::now() + STOCK_BATCH_TIMEOUT;
+    let mut completed = Vec::new();
+    while let Ok(Some(task_result)) = tokio::time::timeout_at(deadline, responses.next()).await {
+        match task_result {
+            Ok((index, Ok(response))) => completed.push((index, response)),
+            Ok((_index, Err((status, message)))) => {
                 tracing::warn!(%status, %message, "skipping unavailable stock in batch response");
-                let _ = index;
-                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "stock batch task failed");
             }
         }
-    })
-    .collect::<Vec<_>>()
-    .await;
-    let mut responses = responses;
+    }
+    let mut responses = completed;
     responses.sort_unstable_by_key(|(index, _)| *index);
     let responses = responses
         .into_iter()
@@ -446,7 +462,15 @@ async fn fetch_stock_normalized(
 
     let (flight, leader) = start_or_join_stock_flight(&cache_key).await;
     if !leader {
-        return wait_for_stock_flight(flight).await;
+        return match tokio::time::timeout(STOCK_PROVIDER_TIMEOUT, wait_for_stock_flight(flight))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                "stock data provider timed out".to_string(),
+            )),
+        };
     }
 
     let result = fetch_remote_stock(
@@ -456,8 +480,14 @@ async fn fetch_stock_normalized(
         interval,
         source_interval,
         bucket_minutes,
-    )
-    .await;
+    );
+    let result = match tokio::time::timeout(STOCK_PROVIDER_TIMEOUT, result).await {
+        Ok(result) => result,
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "stock data provider timed out".to_string(),
+        )),
+    };
 
     let result = match result {
         Ok(response) => {
