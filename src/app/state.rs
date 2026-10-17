@@ -23,6 +23,7 @@ pub struct AppState {
     pub voice_training_token: Option<String>,
     pub voice_train_dir: PathBuf,
     pub voice_training_client: reqwest::Client,
+    pub stock_client: reqwest::Client,
     pub llm_client: reqwest::Client,
     pub allowed_llm_hosts: Arc<HashSet<String>>,
     pub character_system_prompt: String,

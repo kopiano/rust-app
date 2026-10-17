@@ -4,8 +4,8 @@ use axum::{
     http::StatusCode,
 };
 use image::{ImageFormat, imageops::FilterType};
-use serde::Serialize;
 use serde::Deserialize;
+use serde::Serialize;
 use std::{path::PathBuf, time::SystemTime};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -17,11 +17,10 @@ const MAX_MARKDOWN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 pub async fn backfill_content(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query_as::<_, (Uuid, String, String)>(
-        "SELECT id, markdown_path, content FROM docs",
-    )
-    .fetch_all(db)
-    .await?;
+    let rows =
+        sqlx::query_as::<_, (Uuid, String, String)>("SELECT id, markdown_path, content FROM docs")
+            .fetch_all(db)
+            .await?;
 
     for (id, markdown_path, stored_content) in rows {
         let file_content = match fs::read_to_string(&markdown_path).await {
@@ -120,7 +119,11 @@ pub async fn create(
     let mut category = None;
     let mut content = None;
     let mut image = None;
-    while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
         let name = field.name().unwrap_or_default().to_string();
         if name == "image" {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -143,24 +146,39 @@ pub async fn create(
         }
     }
 
-    let title = title.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
+    let title = title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let content = content.unwrap_or_default();
-    let category = category.map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
+    let category = category
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let slug = title_slugify(&title);
     let username_slug = slugify(&username);
-    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs").join(&username_slug);
-    fs::create_dir_all(&directory).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/assets/docs")
+        .join(&username_slug);
+    fs::create_dir_all(&directory)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let markdown_path = directory.join(format!("{slug}.md"));
 
     let image_url = if let Some(bytes) = image {
-        let decoded = image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+        let decoded =
+            image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let resized = decoded.resize_to_fill(720, 480, FilterType::Lanczos3);
         let image_name = format!("{username_slug}-{slug}.webp");
         let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-image");
-        fs::create_dir_all(&image_dir).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        fs::create_dir_all(&image_dir)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let image_path = image_dir.join(&image_name);
         let mut output = std::io::Cursor::new(Vec::new());
-        resized.write_to(&mut output, ImageFormat::WebP).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        resized
+            .write_to(&mut output, ImageFormat::WebP)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let mut image_file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -364,7 +382,10 @@ pub async fn get(
     claims: Option<Extension<Claims>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<DocContent>>, StatusCode> {
-    let user_id = claims.as_ref().map(|Extension(claims)| user_id(claims)).transpose()?;
+    let user_id = claims
+        .as_ref()
+        .map(|Extension(claims)| user_id(claims))
+        .transpose()?;
     let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String, bool)>(
         r#"SELECT id, title, category, image_url, markdown_path, content, public
            FROM docs
@@ -397,7 +418,11 @@ pub async fn update_info(
     let mut category = None;
     let mut image = None;
     let mut public: Option<bool> = None;
-    while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
         let name = field.name().unwrap_or_default().to_string();
         if name == "image" {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -406,20 +431,33 @@ pub async fn update_info(
             }
             image = Some(bytes);
         } else {
-            let value = String::from_utf8(field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?.to_vec())
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            let value = String::from_utf8(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|_| StatusCode::BAD_REQUEST)?
+                    .to_vec(),
+            )
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
             match name.as_str() {
                 "title" => title = Some(value.trim().to_string()),
                 "category" => category = Some(value.trim().to_string()),
-                "public" => public = Some(value.parse::<bool>().map_err(|_| StatusCode::BAD_REQUEST)?),
+                "public" => {
+                    public = Some(value.parse::<bool>().map_err(|_| StatusCode::BAD_REQUEST)?)
+                }
                 _ => {}
             }
         }
     }
-    let title = title.filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
-    let category = category.filter(|value| !value.is_empty()).ok_or(StatusCode::BAD_REQUEST)?;
+    let title = title
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let category = category
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
     let image_url = if let Some(bytes) = image {
-        let decoded = image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+        let decoded =
+            image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let resized = decoded.resize_to_fill(720, 480, FilterType::Lanczos3);
         let image_name = format!(
             "{}-{}.webp",
@@ -427,11 +465,17 @@ pub async fn update_info(
             title_slugify(&title),
         );
         let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-image");
-        fs::create_dir_all(&image_dir).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        fs::create_dir_all(&image_dir)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let image_path = image_dir.join(&image_name);
         let mut output = std::io::Cursor::new(Vec::new());
-        resized.write_to(&mut output, ImageFormat::WebP).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        fs::write(&image_path, output.into_inner()).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        resized
+            .write_to(&mut output, ImageFormat::WebP)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        fs::write(&image_path, output.into_inner())
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         Some(format!("/api/assets/docs-image/{image_name}"))
     } else {
         None
@@ -442,10 +486,24 @@ pub async fn update_info(
            WHERE id = $1 AND user_id = $6
            RETURNING id, title, category, image_url, markdown_path, content, public"#,
     )
-    .bind(id).bind(&title).bind(&category).bind(&image_url).bind(&public).bind(user_id)
-    .fetch_optional(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .bind(id)
+    .bind(&title)
+    .bind(&category)
+    .bind(&image_url)
+    .bind(&public)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(ApiResponse::success(DocContent { id: row.0, title: row.1, category: row.2, image: row.3, content: row.5, public: row.6 })))
+    Ok(Json(ApiResponse::success(DocContent {
+        id: row.0,
+        title: row.1,
+        category: row.2,
+        image: row.3,
+        content: row.5,
+        public: row.6,
+    })))
 }
 
 pub async fn delete(
@@ -477,7 +535,10 @@ pub async fn delete(
 
 async fn username_for_doc(db: &sqlx::PgPool, user_id: Uuid) -> Result<String, StatusCode> {
     sqlx::query_scalar::<_, String>(r#"SELECT name FROM "user" WHERE id = $1"#)
-        .bind(user_id).fetch_optional(db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .bind(user_id)
+        .fetch_optional(db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -506,9 +567,7 @@ pub async fn update(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)
     .map(PathBuf::from)?;
-    let old_content = fs::read(&path)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let old_content = fs::read(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
     let temp_path = path.with_extension(format!("md.{}.tmp", Uuid::new_v4()));
     fs::write(&temp_path, input.content.as_bytes())
         .await
@@ -518,11 +577,12 @@ pub async fn update(
         tracing::error!(%error, "Failed to replace document content");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    let update_result = sqlx::query("UPDATE docs SET content = $2, updated_at = NOW() WHERE id = $1")
-        .bind(id)
-        .bind(&input.content)
-        .execute(&state.db)
-        .await;
+    let update_result =
+        sqlx::query("UPDATE docs SET content = $2, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(&input.content)
+            .execute(&state.db)
+            .await;
     if let Err(error) = update_result {
         tracing::error!(%error, "Failed to update document metadata");
         if let Err(restore_error) = fs::write(&path, old_content).await {
@@ -538,13 +598,20 @@ fn user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
 }
 
 fn slugify(value: &str) -> String {
-    let slug = value.chars().map(|character| {
-        if character.is_alphanumeric() {
-            if character.is_ascii() { character.to_ascii_lowercase() } else { character }
-        } else {
-            '-'
-        }
-    }).collect::<String>();
+    let slug = value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                if character.is_ascii() {
+                    character.to_ascii_lowercase()
+                } else {
+                    character
+                }
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
     let slug = slug.trim_matches('-');
     if slug.is_empty() {
         format!("document-{}", timestamp())
@@ -569,5 +636,8 @@ fn title_slugify(value: &str) -> String {
 }
 
 fn timestamp() -> u64 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|duration| duration.as_secs()).unwrap_or_default()
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
 }

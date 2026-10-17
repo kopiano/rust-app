@@ -1,16 +1,13 @@
 use crate::app::AppState;
 use crate::handles::{
-    auth, character, docs, message, moment, music, store, subscription, system, task, user, video, voice,
-    voice_training,
+    auth, character, docs, message, moment, music, stocks, store, subscription, system, task, user,
+    video, voice, voice_training,
 };
 use crate::middleware::{concurrency, cors, jwt, logger, plan};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::{
-        HeaderName, HeaderValue,
-        header::CACHE_CONTROL,
-    },
+    http::{HeaderName, HeaderValue, header::CACHE_CONTROL},
     middleware,
     routing::{delete, get, patch, post, put},
 };
@@ -24,6 +21,8 @@ const MAX_VIDEO_UPLOAD_CHUNK_BODY_BYTES: usize = 8 * 1024 * 1024 + 64 * 1024;
 const NO_STORE_CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate, max-age=0";
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 const CDN_CACHE_CONTROL: &str = "public, max-age=31536000";
+const STOCK_CACHE_CONTROL: &str = "public, max-age=15, stale-while-revalidate=45";
+const STOCK_CATALOG_CACHE_CONTROL: &str = "public, max-age=3600, stale-while-revalidate=86400";
 
 fn asset_directory(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -47,6 +46,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(voice_api(state.clone()))
         .merge(docs_api(state.clone()))
         .merge(store_api(state.clone()))
+        .merge(stock_api())
         .layer(middleware::from_fn_with_state(
             state.clone(),
             concurrency::limit_http,
@@ -125,10 +125,7 @@ pub fn create_router(state: AppState) -> Router {
                 ))
                 .service(ServeDir::new(asset_directory("store"))),
         )
-         .nest_service(
-              "/api/assets/piano",
-              ServeDir::new(asset_directory("piano")),
-         )
+        .nest_service("/api/assets/piano", ServeDir::new(asset_directory("piano")))
         .nest("/api", api)
         .layer(middleware::from_fn(logger::logger))
         .layer(cors::cors())
@@ -144,7 +141,10 @@ fn store_api(state: AppState) -> Router<AppState> {
         .route("/store/products", post(store::create))
         .route("/store/cart", get(store::cart_list))
         .route("/store/cart/items", post(store::cart_upsert))
-        .route("/store/cart/items/{id}", patch(store::cart_update).delete(store::cart_delete))
+        .route(
+            "/store/cart/items/{id}",
+            patch(store::cart_update).delete(store::cart_delete),
+        )
         .layer(DefaultBodyLimit::max(12 * 1024 * 1024 + 64 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new()
@@ -169,7 +169,22 @@ fn system_api() -> Router<AppState> {
         .route("/metrics", get(system::metrics))
 }
 
-
+fn stock_api() -> Router<AppState> {
+    let catalog = Router::new()
+        .route("/stocks/catalog", get(stocks::catalog))
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static(STOCK_CATALOG_CACHE_CONTROL),
+        ));
+    let quotes = Router::new()
+        .route("/stocks", get(stocks::list))
+        .route("/stocks/{symbol}", get(stocks::get))
+        .layer(SetResponseHeaderLayer::overriding(
+            CACHE_CONTROL,
+            HeaderValue::from_static(STOCK_CACHE_CONTROL),
+        ));
+    Router::new().merge(catalog).merge(quotes)
+}
 
 fn user_api(state: AppState) -> Router<AppState> {
     Router::new()
@@ -446,10 +461,26 @@ fn docs_api(state: AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/docs", get(docs::list))
         .route("/docs/{id}", get(docs::get))
-        .route_layer(middleware::from_fn_with_state(state.clone(), jwt::optional_auth));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            jwt::optional_auth,
+        ));
     let authenticated = Router::new()
-        .route("/docs", post(docs::create_dispatch).layer(DefaultBodyLimit::max(12 * 1024 * 1024)).layer(middleware::from_fn_with_state(state.clone(), concurrency::limit_upload)))
-        .route("/docs/{id}", put(docs::update).patch(docs::update_info).delete(docs::delete))
+        .route(
+            "/docs",
+            post(docs::create_dispatch)
+                .layer(DefaultBodyLimit::max(12 * 1024 * 1024))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    concurrency::limit_upload,
+                )),
+        )
+        .route(
+            "/docs/{id}",
+            put(docs::update)
+                .patch(docs::update_info)
+                .delete(docs::delete),
+        )
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new().merge(public).merge(authenticated)

@@ -1,8 +1,12 @@
-use axum::{Extension, Json, extract::{Multipart, Path, State}, http::StatusCode};
+use axum::{
+    Extension, Json,
+    extract::{Multipart, Path, State},
+    http::StatusCode,
+};
 use image::{ImageFormat, imageops::FilterType};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::Path as FilePath};
-use serde::Serialize;
 use uuid::Uuid;
 
 use crate::{app::AppState, common::response::ApiResponse, middleware::jwt::Claims};
@@ -41,7 +45,10 @@ pub struct CartItemInput {
 fn valid_cart_input(input: &CartItemInput) -> bool {
     matches!(input.size.as_str(), "small" | "medium" | "large")
         && matches!(input.temperature.as_str(), "iced" | "hot" | "room")
-        && matches!(input.sweetness.as_str(), "standard" | "less" | "extra" | "none")
+        && matches!(
+            input.sweetness.as_str(),
+            "standard" | "less" | "extra" | "none"
+        )
         && (1..=99).contains(&input.quantity)
 }
 
@@ -53,7 +60,11 @@ pub async fn cart_list(
     let items = sqlx::query_as::<_, StoreCartItem>(
         "SELECT id, product_id, size, temperature, sweetness, quantity
          FROM store_cart WHERE user_id = $1 ORDER BY created_at ASC, id ASC",
-    ).bind(user_id).fetch_all(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ApiResponse::success(items)))
 }
 
@@ -63,7 +74,9 @@ pub async fn cart_upsert(
     Json(input): Json<CartItemInput>,
 ) -> Result<Json<ApiResponse<StoreCartItem>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    if !valid_cart_input(&input) { return Err(StatusCode::BAD_REQUEST); }
+    if !valid_cart_input(&input) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let item = sqlx::query_as::<_, StoreCartItem>(
         "INSERT INTO store_cart (id, user_id, product_id, size, temperature, sweetness, quantity)
          SELECT $1, $2, $3, $4, $5, $6, $7
@@ -85,14 +98,25 @@ pub async fn cart_update(
     Json(input): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<StoreCartItem>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let quantity = input.get("quantity").and_then(|v| v.as_i64()).ok_or(StatusCode::BAD_REQUEST)?;
-    if !(1..=99).contains(&quantity) { return Err(StatusCode::BAD_REQUEST); }
+    let quantity = input
+        .get("quantity")
+        .and_then(|v| v.as_i64())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    if !(1..=99).contains(&quantity) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let item = sqlx::query_as::<_, StoreCartItem>(
         "UPDATE store_cart SET quantity = $1, updated_at = NOW()
          WHERE id = $2 AND user_id = $3
          RETURNING id, product_id, size, temperature, sweetness, quantity",
-    ).bind(quantity as i32).bind(id).bind(user_id).fetch_optional(&state.db)
-        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?.ok_or(StatusCode::NOT_FOUND)?;
+    )
+    .bind(quantity as i32)
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(ApiResponse::success(item)))
 }
 
@@ -103,11 +127,17 @@ pub async fn cart_delete(
 ) -> Result<Json<ApiResponse<()>>, StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
     sqlx::query("DELETE FROM store_cart WHERE id = $1 AND user_id = $2")
-        .bind(id).bind(user_id).execute(&state.db).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .bind(id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ApiResponse::success(())))
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<ApiResponse<Vec<StoreProduct>>>, StatusCode> {
+pub async fn list(
+    State(state): State<AppState>,
+) -> Result<Json<ApiResponse<Vec<StoreProduct>>>, StatusCode> {
     let products = sqlx::query_as::<_, StoreProduct>(
         "SELECT id, name, category, price, sales, image_url FROM store ORDER BY created_at ASC, id ASC",
     )
@@ -126,11 +156,17 @@ pub async fn create(
     let mut price = None;
     let mut sales = None;
     let mut image = None;
-    while let Some(field) = multipart.next_field().await.map_err(|_| StatusCode::BAD_REQUEST)? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
         let field_name = field.name().unwrap_or_default().to_owned();
         if field_name == "image" {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
-            if bytes.len() > MAX_IMAGE_BYTES { return Err(StatusCode::PAYLOAD_TOO_LARGE); }
+            if bytes.len() > MAX_IMAGE_BYTES {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE);
+            }
             image = Some(bytes);
         } else {
             let value = field.text().await.map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -148,31 +184,48 @@ pub async fn create(
     let price = price.ok_or(StatusCode::BAD_REQUEST)?;
     let sales = sales.unwrap_or(0);
     let bytes = image.ok_or(StatusCode::BAD_REQUEST)?;
-    if name.is_empty() || name.chars().count() > 80
+    if name.is_empty()
+        || name.chars().count() > 80
         || !matches!(category.as_str(), "coffee" | "tea" | "bakery")
-        || !(1..=9_999_900).contains(&price) || !(0..=99_999_999).contains(&sales)
-        || bytes.is_empty() || image::load_from_memory(&bytes).is_err()
-    { return Err(StatusCode::BAD_REQUEST); }
+        || !(1..=9_999_900).contains(&price)
+        || !(0..=99_999_999).contains(&sales)
+        || bytes.is_empty()
+        || image::load_from_memory(&bytes).is_err()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let encoded = tokio::task::spawn_blocking(move || encode_store_image(&bytes))
-        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
 
     let id = Uuid::new_v4();
     let image_filename = store_image_filename(&encoded);
     let image_url = format!("/api/assets/store/{image_filename}");
     let path = FilePath::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/assets/store").join(&image_filename);
+        .join("src/assets/store")
+        .join(&image_filename);
     tokio::fs::create_dir_all(path.parent().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?)
-        .await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tokio::fs::write(&path, &encoded).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tokio::fs::write(&path, &encoded)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let result = sqlx::query_as::<_, StoreProduct>(
         "INSERT INTO store (id, user_id, name, category, price, sales, image_url) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
          RETURNING id, name, category, price, sales, image_url",
     )
-    .bind(id).bind(user_id).bind(name).bind(category).bind(price).bind(sales).bind(image_url)
-    .fetch_one(&state.db).await;
+    .bind(id)
+    .bind(user_id)
+    .bind(name)
+    .bind(category)
+    .bind(price)
+    .bind(sales)
+    .bind(image_url)
+    .fetch_one(&state.db)
+    .await;
     match result {
         Ok(product) => Ok((StatusCode::CREATED, Json(ApiResponse::success(product)))),
         Err(error) => {
@@ -212,7 +265,10 @@ mod tests {
 
         let webp = encode_store_image(&png.into_inner()).unwrap();
         assert_eq!(image::guess_format(&webp).unwrap(), ImageFormat::WebP);
-        assert_eq!(image::load_from_memory(&webp).unwrap().dimensions(), (1600, 1067));
+        assert_eq!(
+            image::load_from_memory(&webp).unwrap().dimensions(),
+            (1600, 1067)
+        );
     }
 
     #[test]
@@ -225,6 +281,10 @@ mod tests {
         let filename = store_image_filename(b"encoded webp");
         assert_eq!(filename.len(), 13);
         assert!(filename.ends_with(".webp"));
-        assert!(filename[..8].chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(
+            filename[..8]
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+        );
     }
 }

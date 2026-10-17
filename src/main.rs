@@ -63,6 +63,13 @@ async fn main() {
         .connect_timeout(std::time::Duration::from_secs(15))
         .build()
         .expect("Unable to build voice training HTTP client");
+    let stock_client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_millis(500))
+        .timeout(std::time::Duration::from_secs(3))
+        .pool_max_idle_per_host(16)
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .expect("Unable to build stock HTTP client");
     // state
     let state = app::AppState {
         db: pool,
@@ -82,6 +89,7 @@ async fn main() {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| std::path::PathBuf::from("src/assets/train")),
         voice_training_client,
+        stock_client,
         llm_client,
         allowed_llm_hosts: Arc::new(allowed_llm_hosts),
         character_system_prompt: std::env::var("CHARACTER_SYSTEM_PROMPT").unwrap_or_else(|_| {
