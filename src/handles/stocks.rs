@@ -34,7 +34,6 @@ pub struct StockCatalogItem {
     pub symbol: &'static str,
     pub name: &'static str,
     pub market: &'static str,
-    pub category: &'static str,
 }
 
 const CATALOG: &[StockCatalogItem] = &[
@@ -42,181 +41,151 @@ const CATALOG: &[StockCatalogItem] = &[
         symbol: "600519.SS",
         name: "贵州茅台",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "601398.SS",
         name: "工商银行",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "601318.SS",
         name: "中国平安",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "600036.SS",
         name: "招商银行",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "000858.SZ",
         name: "五粮液",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "000651.SZ",
         name: "格力电器",
         market: "CN",
-        category: "国内大公司",
     },
     StockCatalogItem {
         symbol: "688825.SS",
         name: "长鑫科技",
         market: "CN",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "688836.SS",
         name: "宇树科技",
         market: "CN",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "002624.SZ",
         name: "完美世界",
         market: "CN",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "688180.SS",
         name: "君实生物",
         market: "CN",
-        category: "生物医药",
     },
     StockCatalogItem {
         symbol: "688981.SS",
         name: "中芯国际",
         market: "CN",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "300750.SZ",
         name: "宁德时代",
         market: "CN",
-        category: "新能源",
     },
     StockCatalogItem {
         symbol: "002594.SZ",
         name: "比亚迪",
         market: "CN",
-        category: "新能源",
     },
     StockCatalogItem {
         symbol: "0700.HK",
         name: "腾讯控股",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "9988.HK",
         name: "阿里巴巴",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "3690.HK",
         name: "美团",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "1810.HK",
         name: "小米集团",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "9626.HK",
         name: "哔哩哔哩",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "9618.HK",
         name: "京东集团",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "9999.HK",
         name: "网易",
         market: "HK",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "BIDU",
         name: "百度",
         market: "US",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "PDD",
         name: "拼多多",
         market: "US",
-        category: "国内科技",
     },
     StockCatalogItem {
         symbol: "AAPL",
         name: "Apple",
         market: "US",
-        category: "海外科技",
     },
     StockCatalogItem {
         symbol: "MSFT",
         name: "Microsoft",
         market: "US",
-        category: "海外科技",
     },
     StockCatalogItem {
         symbol: "NVDA",
         name: "NVIDIA",
         market: "US",
-        category: "海外科技",
     },
     StockCatalogItem {
         symbol: "GOOGL",
         name: "Alphabet",
         market: "US",
-        category: "海外大公司",
     },
     StockCatalogItem {
         symbol: "AMZN",
         name: "Amazon",
         market: "US",
-        category: "海外大公司",
     },
     StockCatalogItem {
         symbol: "META",
         name: "Meta Platforms",
         market: "US",
-        category: "海外科技",
     },
     StockCatalogItem {
         symbol: "TSLA",
         name: "Tesla",
         market: "US",
-        category: "海外科技",
     },
     StockCatalogItem {
         symbol: "JPM",
         name: "JPMorgan Chase",
         market: "US",
-        category: "海外大公司",
     },
 ];
 
@@ -232,7 +201,6 @@ pub struct StockResponse {
     pub symbol: String,
     pub name: String,
     pub market: String,
-    pub category: String,
     pub currency: Option<String>,
     pub exchange: Option<String>,
     pub price: Option<f64>,
@@ -983,10 +951,6 @@ async fn fetch_tencent_stock(
         symbol: symbol.to_string(),
         name: catalog.map(|item| item.name).unwrap_or(symbol).to_string(),
         market: market.to_string(),
-        category: catalog
-            .map(|item| item.category)
-            .unwrap_or("其他")
-            .to_string(),
         currency: Some(if market == "HK" { "HKD" } else { "CNY" }.to_string()),
         exchange: Some(if market == "HK" { "HKEX" } else { "SSE/SZSE" }.to_string()),
         price,
@@ -1101,10 +1065,6 @@ async fn fetch_yahoo_stock(
             .map(|item| item.market)
             .unwrap_or("UNKNOWN")
             .to_string(),
-        category: catalog
-            .map(|item| item.category)
-            .unwrap_or("其他")
-            .to_string(),
         currency: meta["currency"].as_str().map(str::to_string),
         exchange: meta["exchangeName"].as_str().map(str::to_string),
         price,
@@ -1182,10 +1142,23 @@ async fn fetch_nasdaq_stock(
                 (previous != 0.0).then_some(change / previous * 100.0)
             })
         });
-    let volume = data.get("volume").and_then(parse_number);
-    let points = data
-        .get("chart")
-        .and_then(Value::as_array)
+    let chart = data.get("chart").and_then(Value::as_array);
+    let volume = data
+        .get("volume")
+        .and_then(parse_number)
+        .or_else(|| {
+            chart
+                .into_iter()
+                .flatten()
+                .rev()
+                .find_map(|point| {
+                    point
+                        .get("volume")
+                        .or_else(|| point.get("v"))
+                        .and_then(parse_number)
+                })
+        });
+    let points = chart
         .into_iter()
         .flatten()
         .filter_map(|point| {
@@ -1203,10 +1176,6 @@ async fn fetch_nasdaq_stock(
         symbol: symbol.to_string(),
         name: catalog.map(|item| item.name).unwrap_or(symbol).to_string(),
         market: catalog.map(|item| item.market).unwrap_or("US").to_string(),
-        category: catalog
-            .map(|item| item.category)
-            .unwrap_or("海外股票")
-            .to_string(),
         currency: Some("USD".to_string()),
         exchange: data
             .get("exchange")
