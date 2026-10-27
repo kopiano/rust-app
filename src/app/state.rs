@@ -1,7 +1,7 @@
 use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 
 use crate::{
     app::runtime::{AppMetrics, RuntimeLimits},
@@ -34,6 +34,7 @@ pub struct AppState {
     pub pro_checkout_url: Option<String>,
     pub subscription_webhook_secret: Option<String>,
     pub message_hub: Arc<MessageHub>,
+    pub order_outbox_notify: Arc<Notify>,
     pub music_tx: broadcast::Sender<MusicProcessingBroadcast>,
     pub video_tx: broadcast::Sender<VideoProgressBroadcast>,
     pub limits: Arc<RuntimeLimits>,

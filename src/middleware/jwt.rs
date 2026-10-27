@@ -66,7 +66,6 @@ pub async fn require_auth(State(state): State<AppState>, mut req: Request, next:
         Ok(t) => t,
         Err(status) => return status.into_response(),
     };
-
     let claims = match verify(token, &state.jwt_secret) {
         Ok(c) => c,
         Err(resp) => return resp.into_response(),

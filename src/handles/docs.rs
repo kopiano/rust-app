@@ -55,7 +55,7 @@ pub struct DocListItem {
     pub title: String,
     pub category: String,
     pub date: String,
-    pub image: Option<String>,
+    pub cover: Option<String>,
     pub accent: String,
     pub content: String,
     pub public: bool,
@@ -75,7 +75,7 @@ pub async fn list(
     if query.public {
         let docs = sqlx::query_as::<_, DocListItem>(
             r#"SELECT id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                      image_url AS image, 'violet' AS accent, content, public
+                      cover_url AS cover, 'violet' AS accent, content, public
                FROM docs
                WHERE public = TRUE
                ORDER BY updated_at DESC"#,
@@ -92,7 +92,7 @@ pub async fn list(
     let user_id = user_id(&claims)?;
     let docs = sqlx::query_as::<_, DocListItem>(
         r#"SELECT id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                  image_url AS image, 'violet' AS accent, content, public
+                  cover_url AS cover, 'violet' AS accent, content, public
            FROM docs WHERE user_id = $1 ORDER BY updated_at DESC"#,
     )
     .bind(user_id)
@@ -118,19 +118,19 @@ pub async fn create(
     let mut title = None;
     let mut category = None;
     let mut content = None;
-    let mut image = None;
+    let mut cover = None;
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?
     {
         let name = field.name().unwrap_or_default().to_string();
-        if name == "image" {
+        if name == "cover" {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
             if bytes.len() > MAX_IMAGE_BYTES {
                 return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            image = Some(bytes);
+            cover = Some(bytes);
         } else {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
             if bytes.len() > MAX_MARKDOWN_BYTES {
@@ -165,16 +165,16 @@ pub async fn create(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let markdown_path = directory.join(format!("{slug}.md"));
 
-    let image_url = if let Some(bytes) = image {
+    let cover_url = if let Some(bytes) = cover {
         let decoded =
             image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let resized = decoded.resize_to_fill(720, 480, FilterType::Lanczos3);
-        let image_name = format!("{username_slug}-{slug}.webp");
-        let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-image");
-        fs::create_dir_all(&image_dir)
+        let cover_name = format!("{username_slug}-{slug}.webp");
+        let cover_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-cover");
+        fs::create_dir_all(&cover_dir)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let image_path = image_dir.join(&image_name);
+        let cover_path = cover_dir.join(&cover_name);
         let mut output = std::io::Cursor::new(Vec::new());
         resized
             .write_to(&mut output, ImageFormat::WebP)
@@ -182,7 +182,7 @@ pub async fn create(
         let mut image_file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&image_path)
+            .open(&cover_path)
             .await
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -192,14 +192,14 @@ pub async fn create(
                 }
             })?;
         if let Err(error) = image_file.write_all(&output.into_inner()).await {
-            let _ = fs::remove_file(&image_path).await;
+            let _ = fs::remove_file(&cover_path).await;
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             });
         }
-        Some(format!("/api/assets/docs-image/{image_name}"))
+        Some(format!("/api/assets/docs-cover/{cover_name}"))
     } else {
         None
     };
@@ -212,12 +212,12 @@ pub async fn create(
     {
         Ok(file) => file,
         Err(error) => {
-            if let Some(image_url) = &image_url {
-                if let Some(image_name) = image_url.rsplit('/').next() {
-                    let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("src/assets/docs-image")
-                        .join(image_name);
-                    let _ = fs::remove_file(image_path).await;
+            if let Some(cover_url) = &cover_url {
+                if let Some(cover_name) = cover_url.rsplit('/').next() {
+                    let cover_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("src/assets/docs-cover")
+                        .join(cover_name);
+                    let _ = fs::remove_file(cover_path).await;
                 }
             }
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -229,12 +229,12 @@ pub async fn create(
     };
     if let Err(error) = markdown_file.write_all(content.as_bytes()).await {
         let _ = fs::remove_file(&markdown_path).await;
-        if let Some(image_url) = &image_url {
-            if let Some(image_name) = image_url.rsplit('/').next() {
-                let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/assets/docs-image")
-                    .join(image_name);
-                let _ = fs::remove_file(image_path).await;
+        if let Some(cover_url) = &cover_url {
+            if let Some(cover_name) = cover_url.rsplit('/').next() {
+                let cover_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/assets/docs-cover")
+                    .join(cover_name);
+                let _ = fs::remove_file(cover_path).await;
             }
         }
         return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -245,17 +245,17 @@ pub async fn create(
     }
 
     let row = sqlx::query_as::<_, DocListItem>(
-        r#"INSERT INTO docs (user_id, title, category, content, markdown_path, image_url)
+        r#"INSERT INTO docs (user_id, title, category, content, markdown_path, cover_url)
            VALUES ($1, $2, $3, $4, $5, $6)
            RETURNING id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                     image_url AS image, 'violet' AS accent, content, public"#,
+                     cover_url AS cover, 'violet' AS accent, content, public"#,
     )
     .bind(user_id)
     .bind(&title)
     .bind(&category)
     .bind(&content)
     .bind(markdown_path.to_string_lossy().to_string())
-    .bind(&image_url)
+    .bind(&cover_url)
     .fetch_one(&state.db)
     .await;
     let row = match row {
@@ -263,12 +263,12 @@ pub async fn create(
         Err(error) => {
             tracing::error!(%error, "Failed to insert document");
             let _ = fs::remove_file(&markdown_path).await;
-            if let Some(image_url) = &image_url {
-                if let Some(image_name) = image_url.rsplit('/').next() {
-                    let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("src/assets/docs-image")
-                        .join(image_name);
-                    let _ = fs::remove_file(image_path).await;
+            if let Some(cover_url) = &cover_url {
+                if let Some(cover_name) = cover_url.rsplit('/').next() {
+                    let cover_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("src/assets/docs-cover")
+                        .join(cover_name);
+                    let _ = fs::remove_file(cover_path).await;
                 }
             }
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
@@ -345,10 +345,10 @@ pub async fn create_dispatch(
 
     let user_id = user_id(&claims)?;
     let result = sqlx::query_as::<_, DocListItem>(
-        r#"INSERT INTO docs (user_id, title, category, content, markdown_path, image_url)
+        r#"INSERT INTO docs (user_id, title, category, content, markdown_path, cover_url)
            VALUES ($1, $2, $3, $4, $5, NULL)
            RETURNING id, title, category, TO_CHAR(updated_at, 'YYYY-MM-DD HH24:MI') AS date,
-                     image_url AS image, 'violet' AS accent, content"#,
+                     cover_url AS cover, 'violet' AS accent, content"#,
     )
     .bind(user_id)
     .bind(&title)
@@ -372,7 +372,7 @@ pub struct DocContent {
     pub id: Uuid,
     pub title: String,
     pub category: String,
-    pub image: Option<String>,
+    pub cover: Option<String>,
     pub content: String,
     pub public: bool,
 }
@@ -387,7 +387,7 @@ pub async fn get(
         .map(|Extension(claims)| user_id(claims))
         .transpose()?;
     let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String, bool)>(
-        r#"SELECT id, title, category, image_url, markdown_path, content, public
+        r#"SELECT id, title, category, cover_url, markdown_path, content, public
            FROM docs
            WHERE id = $1 AND (public = TRUE OR ($2::uuid IS NOT NULL AND user_id = $2))"#,
     )
@@ -401,7 +401,7 @@ pub async fn get(
         id: row.0,
         title: row.1,
         category: row.2,
-        image: row.3,
+        cover: row.3,
         content: row.5,
         public: row.6,
     })))
@@ -416,7 +416,7 @@ pub async fn update_info(
     let user_id = user_id(&claims)?;
     let mut title = None;
     let mut category = None;
-    let mut image = None;
+    let mut cover = None;
     let mut public: Option<bool> = None;
     while let Some(field) = multipart
         .next_field()
@@ -424,12 +424,12 @@ pub async fn update_info(
         .map_err(|_| StatusCode::BAD_REQUEST)?
     {
         let name = field.name().unwrap_or_default().to_string();
-        if name == "image" {
+        if name == "cover" {
             let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
             if bytes.len() > MAX_IMAGE_BYTES {
                 return Err(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            image = Some(bytes);
+            cover = Some(bytes);
         } else {
             let value = String::from_utf8(
                 field
@@ -455,41 +455,41 @@ pub async fn update_info(
     let category = category
         .filter(|value| !value.is_empty())
         .ok_or(StatusCode::BAD_REQUEST)?;
-    let image_url = if let Some(bytes) = image {
+    let cover_url = if let Some(bytes) = cover {
         let decoded =
             image::load_from_memory(&bytes).map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
         let resized = decoded.resize_to_fill(720, 480, FilterType::Lanczos3);
-        let image_name = format!(
+        let cover_name = format!(
             "{}-{}.webp",
             slugify(&username_for_doc(&state.db, user_id).await?),
             title_slugify(&title),
         );
-        let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-image");
-        fs::create_dir_all(&image_dir)
+        let cover_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets/docs-cover");
+        fs::create_dir_all(&cover_dir)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let image_path = image_dir.join(&image_name);
+        let cover_path = cover_dir.join(&cover_name);
         let mut output = std::io::Cursor::new(Vec::new());
         resized
             .write_to(&mut output, ImageFormat::WebP)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        fs::write(&image_path, output.into_inner())
+        fs::write(&cover_path, output.into_inner())
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        Some(format!("/api/assets/docs-image/{image_name}"))
+        Some(format!("/api/assets/docs-cover/{cover_name}"))
     } else {
         None
     };
     let row = sqlx::query_as::<_, (Uuid, String, String, Option<String>, String, String, bool)>(
-        r#"UPDATE docs SET title = $2, category = $3, image_url = COALESCE($4, image_url),
+        r#"UPDATE docs SET title = $2, category = $3, cover_url = COALESCE($4, cover_url),
                public = COALESCE($5, public), updated_at = NOW()
            WHERE id = $1 AND user_id = $6
-           RETURNING id, title, category, image_url, markdown_path, content, public"#,
+           RETURNING id, title, category, cover_url, markdown_path, content, public"#,
     )
     .bind(id)
     .bind(&title)
     .bind(&category)
-    .bind(&image_url)
+    .bind(&cover_url)
     .bind(&public)
     .bind(user_id)
     .fetch_optional(&state.db)
@@ -500,7 +500,7 @@ pub async fn update_info(
         id: row.0,
         title: row.1,
         category: row.2,
-        image: row.3,
+        cover: row.3,
         content: row.5,
         public: row.6,
     })))
@@ -513,7 +513,7 @@ pub async fn delete(
 ) -> Result<Json<ApiResponse<()>>, StatusCode> {
     let user_id = user_id(&claims)?;
     let row = sqlx::query_as::<_, (String, Option<String>)>(
-        "DELETE FROM docs WHERE id = $1 AND user_id = $2 RETURNING markdown_path, image_url",
+        "DELETE FROM docs WHERE id = $1 AND user_id = $2 RETURNING markdown_path, cover_url",
     )
     .bind(id)
     .bind(user_id)
@@ -522,12 +522,12 @@ pub async fn delete(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)?;
     let _ = fs::remove_file(row.0).await;
-    if let Some(image_url) = row.1 {
-        if let Some(image_name) = image_url.rsplit('/').next() {
-            let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/assets/docs-image")
-                .join(image_name);
-            let _ = fs::remove_file(image_path).await;
+    if let Some(cover_url) = row.1 {
+        if let Some(cover_name) = cover_url.rsplit('/').next() {
+            let cover_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/assets/docs-cover")
+                .join(cover_name);
+            let _ = fs::remove_file(cover_path).await;
         }
     }
     Ok(Json(ApiResponse::success(())))

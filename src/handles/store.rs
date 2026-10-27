@@ -3,8 +3,9 @@ use axum::{
     extract::{Multipart, Path, State},
     http::StatusCode,
 };
+use chrono::{DateTime, Utc};
 use image::{ImageFormat, imageops::FilterType};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::Path as FilePath};
 use uuid::Uuid;
@@ -31,6 +32,40 @@ pub struct StoreCartItem {
     temperature: String,
     sweetness: String,
     quantity: i32,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct StoreOrder {
+    id: Uuid,
+    status: String,
+    total: i64,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct StoreOrderItem {
+    id: Uuid,
+    product_id: Uuid,
+    product_name: String,
+    size: String,
+    temperature: String,
+    sweetness: String,
+    quantity: i32,
+    unit_price: i32,
+    line_total: i64,
+}
+
+#[derive(Serialize)]
+pub struct StoreOrderDetail {
+    #[serde(flatten)]
+    order: StoreOrder,
+    items: Vec<StoreOrderItem>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateOrderInput {
+    idempotency_key: Uuid,
 }
 
 #[derive(serde::Deserialize)]
@@ -133,6 +168,172 @@ pub async fn cart_delete(
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(ApiResponse::success(())))
+}
+
+pub async fn create_order(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Json(input): Json<CreateOrderInput>,
+) -> Result<(StatusCode, Json<ApiResponse<StoreOrder>>), StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let mut tx = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    if let Some(order) = sqlx::query_as::<_, StoreOrder>(
+        "SELECT id, status, total, created_at, updated_at
+         FROM store_order WHERE user_id = $1 AND idempotency_key = $2",
+    )
+    .bind(user_id)
+    .bind(input.idempotency_key)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok((StatusCode::OK, Json(ApiResponse::success(order))));
+    }
+
+    let cart = sqlx::query_as::<_, (Uuid, String, String, String, String, i32, i32)>(
+        "SELECT c.product_id, s.name, c.size, c.temperature, c.sweetness, c.quantity, s.price
+         FROM store_cart c
+         JOIN store s ON s.id = c.product_id
+         WHERE c.user_id = $1
+         ORDER BY c.created_at ASC, c.id ASC
+         FOR UPDATE OF c",
+    )
+    .bind(user_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if cart.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let order_id = Uuid::new_v4();
+    let mut total = 0_i64;
+    for (_, _, size, _, _, quantity, unit_price) in &cart {
+        let extra = match size.as_str() {
+            "medium" => 200_i64,
+            "large" => 400_i64,
+            _ => 0_i64,
+        };
+        total = total
+            .checked_add((i64::from(*unit_price) + extra) * i64::from(*quantity))
+            .ok_or(StatusCode::BAD_REQUEST)?;
+    }
+
+    sqlx::query(
+        "INSERT INTO store_order (id, user_id, idempotency_key, status, total)
+         VALUES ($1, $2, $3, 'pending', $4)",
+    )
+    .bind(order_id)
+    .bind(user_id)
+    .bind(input.idempotency_key)
+    .bind(total)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    for (product_id, name, size, temperature, sweetness, quantity, base_price) in cart {
+        let extra = match size.as_str() {
+            "medium" => 200_i32,
+            "large" => 400_i32,
+            _ => 0_i32,
+        };
+        let unit_price = base_price + extra;
+        sqlx::query(
+            "INSERT INTO store_order_item
+             (id, order_id, product_id, product_name, size, temperature, sweetness, quantity, unit_price)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(order_id)
+        .bind(product_id)
+        .bind(name)
+        .bind(size)
+        .bind(temperature)
+        .bind(sweetness)
+        .bind(quantity)
+        .bind(unit_price)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    sqlx::query(
+        "INSERT INTO store_order_outbox (event_id, order_id, event_type, payload)
+         VALUES ($1, $2, 'store.order.created', jsonb_build_object('order_id', $2::text))",
+    )
+    .bind(Uuid::new_v4())
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    sqlx::query("DELETE FROM store_cart WHERE user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    state.order_outbox_notify.notify_one();
+
+    let order = sqlx::query_as::<_, StoreOrder>(
+        "SELECT id, status, total, created_at, updated_at FROM store_order WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::success(order))))
+}
+
+pub async fn orders(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Json<ApiResponse<Vec<StoreOrder>>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let orders = sqlx::query_as::<_, StoreOrder>(
+        "SELECT id, status, total, created_at, updated_at
+         FROM store_order WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ApiResponse::success(orders)))
+}
+
+pub async fn order_detail(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(order_id): Path<Uuid>,
+) -> Result<Json<ApiResponse<StoreOrderDetail>>, StatusCode> {
+    let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let order = sqlx::query_as::<_, StoreOrder>(
+        "SELECT id, status, total, created_at, updated_at
+         FROM store_order WHERE id = $1 AND user_id = $2",
+    )
+    .bind(order_id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let items = sqlx::query_as::<_, StoreOrderItem>(
+        "SELECT id, product_id, product_name, size, temperature, sweetness, quantity,
+                unit_price, unit_price::bigint * quantity AS line_total
+         FROM store_order_item WHERE order_id = $1 ORDER BY id",
+    )
+    .bind(order_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(ApiResponse::success(StoreOrderDetail { order, items })))
 }
 
 pub async fn list(

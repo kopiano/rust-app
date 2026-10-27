@@ -29,6 +29,21 @@ services:
       timeout: 3s
       retries: 10
 
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: kopiano-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   backend:
     build:
       context: .
@@ -41,6 +56,7 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:123456@postgres:5432/rust_app
       REDIS_URL: redis://redis:6379
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/%2f
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set in .env}
       JWT_MAXAGE: ${JWT_MAXAGE:?JWT_MAXAGE must be set in .env}
       PORT: 8100
@@ -54,6 +70,8 @@ services:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      rabbitmq:
         condition: service_healthy
     ports:
       - "8100:8100"
@@ -116,6 +134,7 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  rabbitmq_data:
   backend_logs:
   gpt_sovits_pretrained:
   gpt_sovits_media:
