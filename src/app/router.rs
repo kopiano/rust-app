@@ -117,6 +117,15 @@ pub fn create_router(state: AppState) -> Router {
                 .service(ServeDir::new(asset_directory("docs-cover"))),
         )
         .nest_service(
+            "/api/assets/docs-img",
+            ServiceBuilder::new()
+                .layer(SetResponseHeaderLayer::overriding(
+                    CACHE_CONTROL,
+                    HeaderValue::from_static(ASSET_CACHE_CONTROL),
+                ))
+                .service(ServeDir::new(asset_directory("docs-img"))),
+        )
+        .nest_service(
             "/api/assets/store",
             ServiceBuilder::new()
                 .layer(SetResponseHeaderLayer::overriding(
@@ -145,7 +154,10 @@ fn store_api(state: AppState) -> Router<AppState> {
             "/store/cart/items/{id}",
             patch(store::cart_update).delete(store::cart_delete),
         )
-        .route("/store/orders", get(store::orders).post(store::create_order))
+        .route(
+            "/store/orders",
+            get(store::orders).post(store::create_order),
+        )
         .route("/store/orders/{id}", get(store::order_detail))
         .layer(DefaultBodyLimit::max(12 * 1024 * 1024 + 64 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
@@ -483,6 +495,7 @@ fn docs_api(state: AppState) -> Router<AppState> {
                 .patch(docs::update_info)
                 .delete(docs::delete),
         )
+        .route("/docs/{id}/images", post(docs::upload_image))
         .layer(DefaultBodyLimit::max(11 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(state, jwt::require_auth));
     Router::new().merge(public).merge(authenticated)

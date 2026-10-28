@@ -1,7 +1,7 @@
 use redis::aio::MultiplexedConnection;
 use sqlx::PgPool;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{Notify, broadcast};
 
 use crate::{
     app::runtime::{AppMetrics, RuntimeLimits},

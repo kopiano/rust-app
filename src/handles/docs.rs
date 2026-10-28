@@ -15,6 +15,8 @@ use crate::{app::AppState, common::response::ApiResponse, middleware::jwt::Claim
 
 const MAX_MARKDOWN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+const DOC_IMAGE_WIDTH: u32 = 1200;
+const DOC_IMAGE_HEIGHT: u32 = 800;
 
 pub async fn backfill_content(db: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     let rows =
@@ -372,6 +374,7 @@ pub struct DocContent {
     pub id: Uuid,
     pub title: String,
     pub category: String,
+    pub markdown_stem: String,
     pub cover: Option<String>,
     pub content: String,
     pub public: bool,
@@ -401,6 +404,11 @@ pub async fn get(
         id: row.0,
         title: row.1,
         category: row.2,
+        markdown_stem: PathBuf::from(&row.4)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
         cover: row.3,
         content: row.5,
         public: row.6,
@@ -500,6 +508,11 @@ pub async fn update_info(
         id: row.0,
         title: row.1,
         category: row.2,
+        markdown_stem: PathBuf::from(&row.4)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string(),
         cover: row.3,
         content: row.5,
         public: row.6,
@@ -545,6 +558,114 @@ async fn username_for_doc(db: &sqlx::PgPool, user_id: Uuid) -> Result<String, St
 #[derive(Debug, Deserialize)]
 pub struct UpdateDocInput {
     pub content: String,
+    #[serde(default)]
+    pub image_renames: Vec<DocImageRename>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DocImageRename {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DocImageUpload {
+    pub path: String,
+    pub url: String,
+}
+
+pub async fn upload_image(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<Uuid>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<ApiResponse<DocImageUpload>>), StatusCode> {
+    let user_id = user_id(&claims)?;
+    let markdown_path = sqlx::query_scalar::<_, String>(
+        "SELECT markdown_path FROM docs WHERE id = $1 AND user_id = $2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::NOT_FOUND)?;
+    let markdown_stem = PathBuf::from(&markdown_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut image_bytes = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?
+    {
+        if field.name() == Some("file") {
+            let bytes = field.bytes().await.map_err(|_| StatusCode::BAD_REQUEST)?;
+            if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
+                return Err(if bytes.len() > MAX_IMAGE_BYTES {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                });
+            }
+            image_bytes = Some(bytes);
+            break;
+        }
+    }
+    let image_bytes = image_bytes.ok_or(StatusCode::BAD_REQUEST)?;
+    let thumbnail_bytes = tokio::task::spawn_blocking(move || {
+        let is_standard_webp = image::guess_format(&image_bytes)
+            .is_ok_and(|format| format == ImageFormat::WebP)
+            && webp::Decoder::new(&image_bytes)
+                .decode()
+                .is_some_and(|image| {
+                    image.width() == DOC_IMAGE_WIDTH && image.height() == DOC_IMAGE_HEIGHT
+                });
+        if is_standard_webp {
+            return Ok::<Vec<u8>, StatusCode>(image_bytes.to_vec());
+        }
+
+        let decoded = image::load_from_memory(&image_bytes)
+            .map_err(|_| StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+        let thumbnail = decoded
+            .resize_to_fill(DOC_IMAGE_WIDTH, DOC_IMAGE_HEIGHT, FilterType::Triangle)
+            .to_rgba8();
+        let encoded =
+            webp::Encoder::from_rgba(thumbnail.as_raw(), thumbnail.width(), thumbnail.height())
+                .encode(78.0);
+        Ok::<Vec<u8>, StatusCode>(encoded.to_vec())
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+
+    let image_name = format!(
+        "{}.webp",
+        Uuid::new_v4().simple().to_string()[..6].to_string()
+    );
+    let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/assets/docs-img")
+        .join(&markdown_stem);
+    fs::create_dir_all(&image_dir)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let image_path = image_dir.join(&image_name);
+    fs::write(&image_path, thumbnail_bytes)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let relative_path = format!("src/assets/docs-img/{markdown_stem}/{image_name}");
+    let asset_url = format!("/api/assets/docs-img/{markdown_stem}/{image_name}");
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(DocImageUpload {
+            path: relative_path,
+            url: asset_url,
+        })),
+    ))
 }
 
 pub async fn update(
@@ -567,13 +688,69 @@ pub async fn update(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .ok_or(StatusCode::NOT_FOUND)
     .map(PathBuf::from)?;
-    let old_content = fs::read(&path).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let old_content = fs::read_to_string(&path)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let markdown_stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let image_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src/assets/docs-img")
+        .join(markdown_stem);
+    let old_images = doc_image_paths(&old_content, markdown_stem);
+    let new_images = doc_image_paths(&input.content, markdown_stem);
+    let removed_images: Vec<String> = old_images
+        .iter()
+        .filter(|name| !new_images.contains(name))
+        .filter(|name| image_name_is_valid(name))
+        .cloned()
+        .collect();
+    let rename_pairs = image_rename_pairs(&old_images, &new_images, &input.image_renames);
+    let mut renamed_images = Vec::new();
+    for (old_name, new_name) in rename_pairs {
+        if old_name == new_name || !image_name_is_valid(old_name) || !image_name_is_valid(new_name)
+        {
+            continue;
+        }
+        let old_path = image_dir.join(old_name);
+        let new_path = image_dir.join(new_name);
+        if fs::metadata(&old_path).await.is_err() {
+            for (from, to) in renamed_images.iter().rev() {
+                let _ = fs::rename(to, from).await;
+            }
+            return Err(StatusCode::NOT_FOUND);
+        }
+        if fs::metadata(&new_path).await.is_ok() {
+            for (from, to) in renamed_images.iter().rev() {
+                let _ = fs::rename(to, from).await;
+            }
+            return Err(StatusCode::CONFLICT);
+        }
+        if let Err(error) = fs::rename(&old_path, &new_path).await {
+            for (from, to) in renamed_images.iter().rev() {
+                let _ = fs::rename(to, from).await;
+            }
+            tracing::error!(%error, "Failed to rename document image");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        renamed_images.push((old_path, new_path));
+    }
     let temp_path = path.with_extension(format!("md.{}.tmp", Uuid::new_v4()));
     fs::write(&temp_path, input.content.as_bytes())
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| {
+            for (from, to) in renamed_images.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     if let Err(error) = fs::rename(&temp_path, &path).await {
         let _ = fs::remove_file(&temp_path).await;
+        for (from, to) in renamed_images.iter().rev() {
+            let _ = fs::rename(to, from).await;
+        }
         tracing::error!(%error, "Failed to replace document content");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -585,12 +762,86 @@ pub async fn update(
             .await;
     if let Err(error) = update_result {
         tracing::error!(%error, "Failed to update document metadata");
-        if let Err(restore_error) = fs::write(&path, old_content).await {
+        if let Err(restore_error) = fs::write(&path, old_content.as_bytes()).await {
             tracing::error!(%restore_error, "Failed to restore document content");
+        }
+        for (from, to) in renamed_images.iter().rev() {
+            let _ = fs::rename(to, from).await;
         }
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
+    for image_name in removed_images {
+        let image_path = image_dir.join(image_name);
+        if let Err(error) = fs::remove_file(&image_path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %error,
+                    path = %image_path.display(),
+                    "Failed to remove unused document image"
+                );
+            }
+        }
+    }
     Ok(Json(ApiResponse::success(())))
+}
+
+fn image_rename_pairs<'a>(
+    old_images: &'a [String],
+    new_images: &'a [String],
+    explicit_renames: &'a [DocImageRename],
+) -> Vec<(&'a str, &'a str)> {
+    if !explicit_renames.is_empty() {
+        return explicit_renames
+            .iter()
+            .filter_map(|rename| {
+                let from = old_images
+                    .iter()
+                    .find(|name| name.as_str() == rename.from)?;
+                let to = new_images.iter().find(|name| name.as_str() == rename.to)?;
+                Some((from.as_str(), to.as_str()))
+            })
+            .collect();
+    }
+
+    let removed: Vec<&str> = old_images
+        .iter()
+        .filter(|name| !new_images.contains(name))
+        .map(String::as_str)
+        .collect();
+    let added: Vec<&str> = new_images
+        .iter()
+        .filter(|name| !old_images.contains(name))
+        .map(String::as_str)
+        .collect();
+    if removed.len() == 1 && added.len() == 1 {
+        vec![(removed[0], added[0])]
+    } else {
+        Vec::new()
+    }
+}
+
+fn doc_image_paths(markdown: &str, markdown_stem: &str) -> Vec<String> {
+    let prefix = format!("src/assets/docs-img/{markdown_stem}/");
+    markdown
+        .split("![")
+        .skip(1)
+        .filter_map(|part| part.split("](").nth(1))
+        .filter_map(|part| part.split(')').next())
+        .filter_map(|path| path.strip_prefix(&prefix))
+        .map(str::to_string)
+        .collect()
+}
+
+fn image_name_is_valid(name: &str) -> bool {
+    name.ends_with(".webp")
+        && name.len() > 5
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || character == '.'
+                || character == '_'
+                || character == '-'
+        })
+        && !name.contains("..")
 }
 
 fn user_id(claims: &Claims) -> Result<Uuid, StatusCode> {
@@ -640,4 +891,42 @@ fn timestamp() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{doc_image_paths, image_rename_pairs};
+
+    #[test]
+    fn extracts_only_document_image_references() {
+        let markdown = concat!(
+            "![cover](src/assets/docs-img/guide/first.webp)\n",
+            "[download](src/assets/docs-img/guide/linked.webp)\n",
+            "![other](src/assets/docs-img/other/ignored.webp)"
+        );
+
+        assert_eq!(
+            doc_image_paths(markdown, "guide"),
+            vec!["first.webp".to_string()]
+        );
+    }
+
+    #[test]
+    fn infers_only_unambiguous_single_image_rename() {
+        let old_images = vec!["first.webp".to_string(), "kept.webp".to_string()];
+        let new_images = vec!["renamed.webp".to_string(), "kept.webp".to_string()];
+
+        assert_eq!(
+            image_rename_pairs(&old_images, &new_images, &[]),
+            vec![("first.webp", "renamed.webp")]
+        );
+    }
+
+    #[test]
+    fn does_not_infer_ambiguous_multiple_image_changes() {
+        let old_images = vec!["first.webp".to_string(), "second.webp".to_string()];
+        let new_images = vec!["third.webp".to_string(), "fourth.webp".to_string()];
+
+        assert!(image_rename_pairs(&old_images, &new_images, &[]).is_empty());
+    }
 }

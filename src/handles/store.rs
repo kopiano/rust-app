@@ -176,7 +176,11 @@ pub async fn create_order(
     Json(input): Json<CreateOrderInput>,
 ) -> Result<(StatusCode, Json<ApiResponse<StoreOrder>>), StatusCode> {
     let user_id: Uuid = claims.sub.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let mut tx = state.db.begin().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut tx = state
+        .db
+        .begin()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
         .bind(user_id)
@@ -194,7 +198,9 @@ pub async fn create_order(
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
-        tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        tx.commit()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         return Ok((StatusCode::OK, Json(ApiResponse::success(order))));
     }
 
@@ -279,7 +285,9 @@ pub async fn create_order(
         .execute(&mut *tx)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    tx.commit().await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     state.order_outbox_notify.notify_one();
 
     let order = sqlx::query_as::<_, StoreOrder>(
@@ -333,7 +341,10 @@ pub async fn order_detail(
     .fetch_all(&state.db)
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(ApiResponse::success(StoreOrderDetail { order, items })))
+    Ok(Json(ApiResponse::success(StoreOrderDetail {
+        order,
+        items,
+    })))
 }
 
 pub async fn list(

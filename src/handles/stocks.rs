@@ -1052,10 +1052,7 @@ async fn fetch_yahoo_stock(
     let percent = change
         .zip(previous_close)
         .and_then(|(change, previous)| (previous != 0.0).then_some(change / previous * 100.0));
-    let volume = volumes
-        .iter()
-        .rev()
-        .find_map(Value::as_f64);
+    let volume = volumes.iter().rev().find_map(Value::as_f64);
     let catalog = CATALOG.iter().find(|item| item.symbol == symbol);
 
     Ok(StockResponse {
@@ -1143,21 +1140,14 @@ async fn fetch_nasdaq_stock(
             })
         });
     let chart = data.get("chart").and_then(Value::as_array);
-    let volume = data
-        .get("volume")
-        .and_then(parse_number)
-        .or_else(|| {
-            chart
-                .into_iter()
-                .flatten()
-                .rev()
-                .find_map(|point| {
-                    point
-                        .get("volume")
-                        .or_else(|| point.get("v"))
-                        .and_then(parse_number)
-                })
-        });
+    let volume = data.get("volume").and_then(parse_number).or_else(|| {
+        chart.into_iter().flatten().rev().find_map(|point| {
+            point
+                .get("volume")
+                .or_else(|| point.get("v"))
+                .and_then(parse_number)
+        })
+    });
     let points = chart
         .into_iter()
         .flatten()
